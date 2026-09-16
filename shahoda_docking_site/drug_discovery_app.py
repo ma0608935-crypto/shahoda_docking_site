@@ -242,7 +242,7 @@ st.markdown(
     """
     <div class="hero">
         <div class="badge">Computational Drug Discovery Platform</div>
-        <h1>From disease to lead compound,<br><span>all in one workspace.</span></h1>
+        <h1>For my girl only,<br><span>her workspace.</span></h1>
         <p>Search the literature, retrieve known drugs, draw and analyze molecules, predict protein targets, and visualize 3D structures — without leaving the page.</p>
     </div>
     """,
