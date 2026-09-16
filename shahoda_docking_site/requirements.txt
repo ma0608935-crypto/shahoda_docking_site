@@ -1,0 +1,6 @@
+streamlit
+streamlit-ketcher
+rdkit
+requests
+fpdf2
+pandas
