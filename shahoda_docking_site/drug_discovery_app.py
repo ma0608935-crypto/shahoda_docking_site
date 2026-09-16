@@ -544,7 +544,7 @@ st.markdown(
         <div class="num">4</div>
         <div>
             <div class="title">Target Prediction</div>
-            <div class="desc">SwissTargetPrediction embedded — paste your SMILES and run the prediction in-app.</div>
+            <div class="desc">SwissTargetPrediction embedded — open it only when you are ready to run the prediction.</div>
         </div>
     </div>
     """,
@@ -552,20 +552,33 @@ st.markdown(
 )
 
 saved = st.session_state.get("swiss_query_smiles") or st.session_state.get("smiles", "")
+
 if saved:
     st.markdown(
         f"""<div class="card">
-        <span style="color:#8b93a1; font-size:0.8rem;">Your current SMILES — copy this into the embedded tool below:</span><br>
+        <span style="color:#8b93a1; font-size:0.8rem;">Your current SMILES — copy this into SwissTargetPrediction:</span><br>
         <code>{saved}</code>
         </div>""",
         unsafe_allow_html=True,
     )
 
-components.iframe(
-    "https://www.swisstargetprediction.ch/",
-    height=900,
-    scrolling=True,
-)
+if "show_swiss" not in st.session_state:
+    st.session_state.show_swiss = False
+
+if not st.session_state.show_swiss:
+    if st.button("🎯  Open SwissTargetPrediction", use_container_width=True, key="open_swiss"):
+        st.session_state.show_swiss = True
+        st.rerun()
+else:
+    if st.button("✕  Close SwissTargetPrediction", use_container_width=True, key="close_swiss"):
+        st.session_state.show_swiss = False
+        st.rerun()
+
+    components.iframe(
+        "https://www.swisstargetprediction.ch/",
+        height=900,
+        scrolling=True,
+    )
 
 # ===========================================================
 # SECTION 5 — 3D Visualization (MolView)
