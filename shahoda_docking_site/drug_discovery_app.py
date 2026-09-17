@@ -11,9 +11,11 @@ Run with:
 
 import io
 import csv
+import json
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from pathlib import Path
 from streamlit_ketcher import st_ketcher
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Crippen, Lipinski, AllChem
@@ -29,6 +31,38 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# ---------------------------------------------------------
+# Persistent storage helpers
+# ---------------------------------------------------------
+DATA_FILE = Path("user_data.json")
+
+
+def load_data():
+    """Load persistent data from JSON file."""
+    if DATA_FILE.exists():
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_data():
+    """Save current session state to JSON file."""
+    data = {
+        "my_compounds": st.session_state.get("my_compounds", []),
+        "scaffold_entries": st.session_state.get("scaffold_entries", []),
+        "scaffold_header": st.session_state.get("scaffold_header", {}),
+        "smiles": st.session_state.get("smiles", ""),
+    }
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass  # silently ignore save failures
+
 
 # ---------------------------------------------------------
 # Global styling — unified dark professional theme
@@ -198,22 +232,23 @@ st.markdown(
 )
 
 # ---------------------------------------------------------
-# Session state defaults
+# Session state defaults — load from persistent file first
 # ---------------------------------------------------------
+_saved = load_data()
+
 if "smiles" not in st.session_state:
-    st.session_state.smiles = ""
+    st.session_state.smiles = _saved.get("smiles", "")
 if "_sync_text_input" not in st.session_state:
     st.session_state["_sync_text_input"] = False
 if "my_compounds" not in st.session_state:
-    st.session_state.my_compounds = []
+    st.session_state.my_compounds = _saved.get("my_compounds", [])
 if "scaffold_entries" not in st.session_state:
-    st.session_state.scaffold_entries = []
+    st.session_state.scaffold_entries = _saved.get("scaffold_entries", [])
 if "scaffold_header" not in st.session_state:
-    st.session_state.scaffold_header = {
-        "title": "SCAFFOLD 12",
-        "original_smiles": "",
-        "targetability": "",
-    }
+    st.session_state.scaffold_header = _saved.get(
+        "scaffold_header",
+        {"title": "SCAFFOLD 12", "original_smiles": "", "targetability": ""},
+    )
 
 # ---------------------------------------------------------
 # Top navigation bar
@@ -388,11 +423,10 @@ def chembl_lookup(indication: str):
             except requests.exceptions.RequestException as e:
                 last_error = e
                 if attempt < retries - 1:
-                    time.sleep(2 ** attempt)  # 1s, 2s, 4s
+                    time.sleep(2 ** attempt)
                 continue
         raise last_error
 
-    # Step 1: search for indications
     try:
         resp = fetch_with_retry(
             "https://www.ebi.ac.uk/chembl/api/data/drug_indication.json",
@@ -410,7 +444,6 @@ def chembl_lookup(indication: str):
     out = []
     failed_count = 0
 
-    # Step 2: fetch each molecule with retry
     for ind in indications:
         molecule_chembl_id = ind.get("molecule_chembl_id")
         if not molecule_chembl_id:
@@ -423,7 +456,7 @@ def chembl_lookup(indication: str):
             )
         except Exception:
             failed_count += 1
-            continue  # skip this molecule, keep going
+            continue
 
         smiles = (mol_resp.get("molecule_structures") or {}).get("canonical_smiles")
         pref_name = mol_resp.get("pref_name") or molecule_chembl_id
@@ -442,6 +475,7 @@ def chembl_lookup(indication: str):
         )
 
     return out
+
 
 if st.button("🔗  Retrieve lead compounds from ChEMBL", use_container_width=True) and disease_query:
     with st.spinner("Querying ChEMBL..."):
@@ -462,10 +496,12 @@ if st.session_state.get("compound_results"):
             if st.button("Send to Molecule Editor →", key=f"send_{c['chembl_id']}", use_container_width=True):
                 st.session_state.smiles = c["smiles"]
                 st.session_state["_sync_text_input"] = True
+                save_data()
                 st.success("SMILES loaded into the Molecule Editor below.")
         with col_b:
             if st.button("Use for Target Prediction", key=f"swiss_{c['chembl_id']}", use_container_width=True):
                 st.session_state["swiss_query_smiles"] = c["smiles"]
+                save_data()
                 st.success("SMILES saved — see the target prediction section below.")
 elif st.session_state.get("compound_results") == []:
     st.warning("No known drugs found — try a broader or alternate name.")
@@ -506,6 +542,7 @@ with left:
     if new_smiles != st.session_state.smiles:
         st.session_state.smiles = new_smiles
         st.session_state["_sync_text_input"] = True
+        save_data()
         st.rerun()
 
 smiles = st.session_state.smiles
@@ -572,6 +609,7 @@ if smiles and Chem.MolFromSmiles(smiles) is not None:
                 "percentage": 0.0,
                 "notes": "",
             })
+            save_data()
             st.success(f"Added! You now have {len(st.session_state.my_compounds)} compound(s).")
     with col_add2:
         st.caption("Save this compound to your personal library at the bottom of the page, where you can set its percentage.")
@@ -716,7 +754,9 @@ else:
                 label_visibility="collapsed",
                 placeholder="Compound name",
             )
-            st.session_state.my_compounds[i]["name"] = new_name
+            if new_name != comp["name"]:
+                st.session_state.my_compounds[i]["name"] = new_name
+                save_data()
         with row2:
             new_pct = st.number_input(
                 "Percentage (%)",
@@ -727,10 +767,13 @@ else:
                 key=f"pct_{i}",
                 label_visibility="collapsed",
             )
-            st.session_state.my_compounds[i]["percentage"] = new_pct
+            if new_pct != comp.get("percentage"):
+                st.session_state.my_compounds[i]["percentage"] = new_pct
+                save_data()
         with row3:
             if st.button("🗑️  Remove", key=f"del_{i}", use_container_width=True):
                 st.session_state.my_compounds.pop(i)
+                save_data()
                 st.rerun()
 
         with st.expander("📝 Notes & SMILES"):
@@ -741,7 +784,9 @@ else:
                 placeholder="e.g. active against Plasmodium falciparum, tested 2024...",
                 height=80,
             )
-            st.session_state.my_compounds[i]["notes"] = new_notes
+            if new_notes != comp.get("notes", ""):
+                st.session_state.my_compounds[i]["notes"] = new_notes
+                save_data()
             st.code(comp["smiles"], language=None)
 
         st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
@@ -769,6 +814,7 @@ else:
     with act2:
         if st.button("🗑️  Clear All", use_container_width=True, key="clear_all_compounds"):
             st.session_state.my_compounds = []
+            save_data()
             st.rerun()
 
     with act3:
@@ -777,6 +823,7 @@ else:
             if total_now > 0:
                 for c in st.session_state.my_compounds:
                     c["percentage"] = round((c.get("percentage", 0) or 0) / total_now * 100, 2)
+                save_data()
                 st.rerun()
             else:
                 st.warning("Set at least one percentage above 0 first.")
@@ -843,7 +890,9 @@ with h1:
         key="scaffold_title_input",
         placeholder="e.g. SCAFFOLD 12",
     )
-    st.session_state.scaffold_header["title"] = new_title
+    if new_title != st.session_state.scaffold_header["title"]:
+        st.session_state.scaffold_header["title"] = new_title
+        save_data()
 with h2:
     new_orig = st.text_input(
         "Original SMILES",
@@ -851,7 +900,9 @@ with h2:
         key="scaffold_orig_input",
         placeholder="O=C(NC(Cc1ccccc1)C#N)C1CCCN1C(=O)C(NC(=O)C1CC1)C(C)C",
     )
-    st.session_state.scaffold_header["original_smiles"] = new_orig
+    if new_orig != st.session_state.scaffold_header["original_smiles"]:
+        st.session_state.scaffold_header["original_smiles"] = new_orig
+        save_data()
 with h3:
     new_targ = st.text_input(
         "Targetability",
@@ -859,11 +910,13 @@ with h3:
         key="scaffold_targ_input",
         placeholder="e.g. 60%",
     )
-    st.session_state.scaffold_header["targetability"] = new_targ
+    if new_targ != st.session_state.scaffold_header["targetability"]:
+        st.session_state.scaffold_header["targetability"] = new_targ
+        save_data()
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# ---------- Add new row form (FIXED with st.form + clear_on_submit) ----------
+# ---------- Add new row form ----------
 st.markdown(
     '<div style="color:#8b93a1; font-size:0.8rem; font-weight:600; '
     'letter-spacing:.3px; text-transform:uppercase; margin-bottom:8px;">'
@@ -892,6 +945,7 @@ with st.form("scaffold_entry_form", clear_on_submit=True):
                 "SMILES": new_smi.strip(),
                 "Percentage": new_pct.strip(),
             })
+            save_data()
             st.rerun()
         else:
             st.warning("Enter at least a D code or a SMILES.")
@@ -900,7 +954,6 @@ with st.form("scaffold_entry_form", clear_on_submit=True):
 if st.session_state.scaffold_entries:
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Header row
     th1, th2, th3, th4, th5 = st.columns([1, 2, 5, 1, 0.7])
     with th1:
         st.markdown('<div style="color:#4fd1c5; font-weight:700; font-size:0.78rem; letter-spacing:.5px;">D</div>', unsafe_allow_html=True)
@@ -915,7 +968,6 @@ if st.session_state.scaffold_entries:
 
     st.markdown('<hr style="margin:6px 0 12px 0; border-color:#1e212b;">', unsafe_allow_html=True)
 
-    # Body rows
     for i, entry in enumerate(st.session_state.scaffold_entries):
         r1, r2, r3, r4, r5 = st.columns([1, 2, 5, 1, 0.7])
         with r1:
@@ -944,9 +996,9 @@ if st.session_state.scaffold_entries:
         with r5:
             if st.button("✕", key=f"del_scaffold_{i}", use_container_width=True):
                 st.session_state.scaffold_entries.pop(i)
+                save_data()
                 st.rerun()
 
-    # ---------- Export buttons ----------
     st.markdown("<br>", unsafe_allow_html=True)
     exp1, exp2, exp3 = st.columns(3)
 
@@ -1045,10 +1097,16 @@ if st.session_state.scaffold_entries:
     with exp3:
         if st.button("🗑️  Clear All Entries", use_container_width=True, key="clear_scaffold"):
             st.session_state.scaffold_entries = []
+            save_data()
             st.rerun()
 
 else:
     st.info("No entries yet — fill in the fields above and click **➕ Add**.")
+
+# ---------------------------------------------------------
+# Auto-save at end of every rerun
+# ---------------------------------------------------------
+save_data()
 
 # ---------------------------------------------------------
 # Footer
