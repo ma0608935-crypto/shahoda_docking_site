@@ -375,21 +375,56 @@ disease_query = st.text_input(
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def chembl_lookup(indication: str):
-    resp = requests.get(
-        "https://www.ebi.ac.uk/chembl/api/data/drug_indication.json",
-        params={"search": indication, "limit": 5},
-        timeout=30,
-    ).json()
+    import time
+
+    def fetch_with_retry(url, params=None, retries=3, base_timeout=60):
+        """Fetch URL with automatic retries on timeout."""
+        last_error = None
+        for attempt in range(retries):
+            try:
+                resp = requests.get(url, params=params, timeout=base_timeout)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.RequestException as e:
+                last_error = e
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)  # 1s, 2s, 4s
+                continue
+        raise last_error
+
+    # Step 1: search for indications
+    try:
+        resp = fetch_with_retry(
+            "https://www.ebi.ac.uk/chembl/api/data/drug_indication.json",
+            params={"search": indication, "limit": 5},
+        )
+    except Exception as e:
+        st.error(
+            f"⚠️ ChEMBL is not responding right now "
+            f"(after 3 retries). Please try again in a minute.\n\n"
+            f"Error type: {type(e).__name__}"
+        )
+        return []
+
     indications = resp.get("drug_indications", [])
     out = []
+    failed_count = 0
+
+    # Step 2: fetch each molecule with retry
     for ind in indications:
         molecule_chembl_id = ind.get("molecule_chembl_id")
         if not molecule_chembl_id:
             continue
-        mol_resp = requests.get(
-            f"https://www.ebi.ac.uk/chembl/api/data/molecule/{molecule_chembl_id}.json",
-            timeout=30,
-        ).json()
+
+        try:
+            mol_resp = fetch_with_retry(
+                f"https://www.ebi.ac.uk/chembl/api/data/molecule/{molecule_chembl_id}.json",
+                retries=2,
+            )
+        except Exception:
+            failed_count += 1
+            continue  # skip this molecule, keep going
+
         smiles = (mol_resp.get("molecule_structures") or {}).get("canonical_smiles")
         pref_name = mol_resp.get("pref_name") or molecule_chembl_id
         if smiles:
@@ -399,8 +434,14 @@ def chembl_lookup(indication: str):
                 "smiles": smiles,
                 "indication": ind.get("efo_term", indication),
             })
-    return out
 
+    if failed_count > 0 and out:
+        st.info(
+            f"ℹ️ Retrieved {len(out)} compound(s). "
+            f"{failed_count} failed due to server timeouts and were skipped."
+        )
+
+    return out
 
 if st.button("🔗  Retrieve lead compounds from ChEMBL", use_container_width=True) and disease_query:
     with st.spinner("Querying ChEMBL..."):
