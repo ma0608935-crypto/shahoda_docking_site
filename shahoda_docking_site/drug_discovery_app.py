@@ -385,149 +385,15 @@ if st.session_state.get("disease_results"):
         )
 
 # ===========================================================
-# SECTION 2 — Lead Compound Lookup (ChEMBL)
+# SECTION 2 — Disease → Protein → Compound (full chain)
 # ===========================================================
 st.markdown(
     """
     <div class="section-head">
         <div class="num">2</div>
         <div>
-            <div class="title">Lead Compound Lookup</div>
-            <div class="desc">Retrieve known drugs, ChEMBL IDs, and SMILES for a given indication.</div>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-disease_query = st.text_input(
-    "Disease or indication name",
-    key="disease_query",
-    placeholder="e.g. malaria, tuberculosis, glioblastoma...",
-    label_visibility="collapsed",
-)
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def chembl_lookup(indication: str):
-    import time
-
-    def fetch_with_retry(url, params=None, retries=3, base_timeout=60):
-        last_error = None
-        for attempt in range(retries):
-            try:
-                resp = requests.get(url, params=params, timeout=base_timeout)
-                resp.raise_for_status()
-                return resp.json()
-            except requests.exceptions.RequestException as e:
-                last_error = e
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)
-                continue
-        raise last_error
-
-    indications = []
-    for param_name in ["efo_term__icontains", "mesh_heading__icontains"]:
-        try:
-            resp = fetch_with_retry(
-                "https://www.ebi.ac.uk/chembl/api/data/drug_indication.json",
-                params={param_name: indication, "limit": 15},
-            )
-            found = resp.get("drug_indications", [])
-            if found:
-                indications = found
-                break
-        except Exception:
-            continue
-
-    if not indications:
-        st.warning(
-            f"No drugs found for '{indication}'. "
-            f"Try a broader term or a different spelling."
-        )
-        return []
-
-    out = []
-    seen_molecules = set()
-    failed_count = 0
-
-    for ind in indications:
-        molecule_chembl_id = ind.get("molecule_chembl_id")
-        if not molecule_chembl_id or molecule_chembl_id in seen_molecules:
-            continue
-        seen_molecules.add(molecule_chembl_id)
-
-        try:
-            mol_resp = fetch_with_retry(
-                f"https://www.ebi.ac.uk/chembl/api/data/molecule/{molecule_chembl_id}.json",
-                retries=2,
-            )
-        except Exception:
-            failed_count += 1
-            continue
-
-        smiles = (mol_resp.get("molecule_structures") or {}).get("canonical_smiles")
-        pref_name = mol_resp.get("pref_name") or molecule_chembl_id
-        if smiles:
-            out.append({
-                "name": pref_name,
-                "chembl_id": molecule_chembl_id,
-                "smiles": smiles,
-                "indication": ind.get("efo_term") or ind.get("mesh_heading") or indication,
-                "phase": ind.get("max_phase_for_ind", "?"),
-            })
-
-    if failed_count > 0 and out:
-        st.info(
-            f"ℹ️ Retrieved {len(out)} compound(s). "
-            f"{failed_count} failed due to server timeouts and were skipped."
-        )
-
-    return out
-
-
-if st.button("🔗  Retrieve lead compounds from ChEMBL", use_container_width=True) and disease_query:
-    with st.spinner("Querying ChEMBL..."):
-        st.session_state.compound_results = chembl_lookup(disease_query)
-
-if st.session_state.get("compound_results"):
-    for c in st.session_state.compound_results:
-        st.markdown(
-            f"""<div class="card">
-            <b>{c['name']}</b> <span style="color:#8b93a1;">({c['chembl_id']})</span><br>
-            <span style="color:#8b93a1; font-size:0.8rem;">
-                Indication: {c['indication']} · Phase: {c.get('phase', '?')}
-            </span><br>
-            <code>{c['smiles']}</code>
-            </div>""",
-            unsafe_allow_html=True,
-        )
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("Send to Molecule Editor →", key=f"send_{c['chembl_id']}", use_container_width=True):
-                st.session_state.smiles = c["smiles"]
-                st.session_state["_sync_text_input"] = True
-                save_data()
-                st.success("SMILES loaded into the Molecule Editor below.")
-        with col_b:
-            if st.button("Use for Target Prediction", key=f"swiss_{c['chembl_id']}", use_container_width=True):
-                st.session_state["swiss_query_smiles"] = c["smiles"]
-                save_data()
-                st.success("SMILES saved — see the target prediction section below.")
-elif st.session_state.get("compound_results") == []:
-    st.warning("No known drugs found — try a broader or alternate name.")
-
-
-# ===========================================================
-# SECTION 2B — Targets & Mechanisms (compound + protein + action)
-# ===========================================================
-st.markdown(
-    """
-    <div class="section-head">
-        <div class="num">2B</div>
-        <div>
-            <div class="title">Targets & Mechanisms</div>
-            <div class="desc">For each drug, see the protein it hits and the mechanism of action.</div>
+            <div class="title">Disease → Protein → Compound</div>
+            <div class="desc">Enter a disease, get its associated proteins, then pull inhibitor compounds from ChEMBL.</div>
         </div>
     </div>
     """,
@@ -536,16 +402,21 @@ st.markdown(
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def chembl_targets_and_mechanisms(indication: str):
+def get_disease_proteins(disease: str):
     """
-    For a disease, get each compound + its protein target + mechanism of action.
+    Step 1: Find proteins associated with a disease using Open Targets Platform.
+    Returns (list_of_targets, matched_disease_name).
     """
     import time
 
-    def fetch(url, params=None, retries=3, base_timeout=60):
+    def post_graphql(query, variables, retries=3, timeout=60):
         for attempt in range(retries):
             try:
-                r = requests.get(url, params=params, timeout=base_timeout)
+                r = requests.post(
+                    "https://api.platform.opentargets.org/api/v4/graphql",
+                    json={"query": query, "variables": variables},
+                    timeout=timeout,
+                )
                 r.raise_for_status()
                 return r.json()
             except Exception:
@@ -553,149 +424,271 @@ def chembl_targets_and_mechanisms(indication: str):
                     time.sleep(2 ** attempt)
         return {}
 
-    # Step 1: get indications
-    indications = []
-    for param in ["efo_term__icontains", "mesh_heading__icontains"]:
-        resp = fetch(
-            "https://www.ebi.ac.uk/chembl/api/data/drug_indication.json",
-            {param: indication, "limit": 15},
-        )
-        if resp.get("drug_indications"):
-            indications = resp["drug_indications"]
-            break
+    # Step 1a: search for the disease EFO ID
+    query_search = """
+    query SearchDisease($q: String!) {
+      search(queryString: $q, entityNames: ["disease"], page: {index: 0, size: 1}) {
+        hits { id name }
+      }
+    }
+    """
+    data = post_graphql(query_search, {"q": disease})
+    hits = data.get("data", {}).get("search", {}).get("hits", [])
+    if not hits:
+        return [], None
+    efo_id = hits[0]["id"]
+    efo_name = hits[0]["name"]
 
-    if not indications:
+    # Step 1b: get associated targets
+    query_targets = """
+    query DiseaseTargets($efoId: String!) {
+      disease(efoId: $efoId) {
+        id
+        name
+        associatedTargets(page: {index: 0, size: 25}) {
+          rows {
+            target { id approvedSymbol approvedName }
+            score
+          }
+        }
+      }
+    }
+    """
+    data = post_graphql(query_targets, {"efoId": efo_id})
+    rows = (
+        data.get("data", {})
+        .get("disease", {})
+        .get("associatedTargets", {})
+        .get("rows", [])
+    )
+
+    targets = []
+    for row in rows:
+        t = row.get("target", {})
+        targets.append({
+            "target_id": t.get("id", ""),
+            "symbol": t.get("approvedSymbol", ""),
+            "name": t.get("approvedName", ""),
+            "score": row.get("score", 0),
+        })
+
+    return targets, efo_name
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_compounds_for_target(target_symbol: str, target_name: str):
+    """
+    Step 2: Find ChEMBL target for this protein, then get active compounds.
+    """
+    import time
+
+    def fetch(url, params=None, retries=3, timeout=60):
+        for attempt in range(retries):
+            try:
+                r = requests.get(url, params=params, timeout=timeout)
+                r.raise_for_status()
+                return r.json()
+            except Exception:
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+        return {}
+
+    search_term = target_symbol or target_name
+    if not search_term:
         return []
 
+    target_resp = fetch(
+        "https://www.ebi.ac.uk/chembl/api/data/target/search.json",
+        params={"q": search_term, "limit": 3},
+    )
+    targets = target_resp.get("targets", [])
+    if not targets:
+        return []
+
+    chembl_target_id = targets[0].get("target_chembl_id")
+    target_type = targets[0].get("target_type", "")
+    pref_name = targets[0].get("pref_name", "")
+
+    if not chembl_target_id:
+        return []
+
+    act_resp = fetch(
+        "https://www.ebi.ac.uk/chembl/api/data/activity.json",
+        params={
+            "target_chembl_id": chembl_target_id,
+            "pchembl_value__isnull": "false",
+            "limit": 30,
+        },
+    )
+    activities = act_resp.get("activities", [])
+
+    best_by_mol = {}
+    for act in activities:
+        mol_id = act.get("molecule_chembl_id")
+        pchembl = act.get("pchembl_value")
+        if not mol_id:
+            continue
+        try:
+            pchembl_val = float(pchembl) if pchembl is not None else 0
+        except (ValueError, TypeError):
+            pchembl_val = 0
+        if mol_id not in best_by_mol or pchembl_val > best_by_mol[mol_id]["pchembl"]:
+            best_by_mol[mol_id] = {
+                "molecule_chembl_id": mol_id,
+                "pchembl": pchembl_val,
+                "activity_type": act.get("standard_type", ""),
+                "activity_value": act.get("standard_value", ""),
+                "activity_units": act.get("standard_units", ""),
+            }
+
     results = []
-    seen = set()
-
-    for ind in indications:
-        mol_id = ind.get("molecule_chembl_id")
-        if not mol_id or mol_id in seen:
-            continue
-        seen.add(mol_id)
-
-        # Get mechanisms (includes target_id + action_type + mechanism_of_action)
-        mech_resp = fetch(
-            "https://www.ebi.ac.uk/chembl/api/data/mechanism.json",
-            {"molecule_chembl_id": mol_id},
-        )
-        mechanisms = mech_resp.get("mechanisms", [])
-
-        # Get molecule name + SMILES
+    for mol_id, info in list(best_by_mol.items())[:15]:
         mol_resp = fetch(
-            f"https://www.ebi.ac.uk/chembl/api/data/molecule/{mol_id}.json"
+            f"https://www.ebi.ac.uk/chembl/api/data/molecule/{mol_id}.json",
         )
-        name = mol_resp.get("pref_name") or mol_id
-        smiles = (mol_resp.get("molecule_structures") or {}).get("canonical_smiles")
-
-        if not mechanisms:
-            # Even without mechanism, still record the compound
-            results.append({
-                "disease": indication,
-                "compound": name,
-                "chembl_id": mol_id,
-                "smiles": smiles,
-                "target_id": "—",
-                "target_name": "—",
-                "target_type": "—",
-                "action_type": "—",
-                "mechanism": "No mechanism recorded",
-                "phase": ind.get("max_phase_for_ind", "?"),
-            })
+        if not mol_resp:
             continue
-
-        for mech in mechanisms:
-            target_id = mech.get("target_chembl_id")
-            action = mech.get("action_type") or "—"
-            moa = mech.get("mechanism_of_action") or "—"
-
-            target_name = "—"
-            target_type = "—"
-            if target_id:
-                t_resp = fetch(
-                    f"https://www.ebi.ac.uk/chembl/api/data/target/{target_id}.json"
-                )
-                target_name = t_resp.get("pref_name") or "—"
-                target_type = t_resp.get("target_type") or "—"
-
+        smiles = (mol_resp.get("molecule_structures") or {}).get("canonical_smiles")
+        name = mol_resp.get("pref_name") or mol_id
+        if smiles:
             results.append({
-                "disease": indication,
+                "chembl_target_id": chembl_target_id,
+                "target_type": target_type,
+                "target_pref_name": pref_name,
                 "compound": name,
                 "chembl_id": mol_id,
                 "smiles": smiles,
-                "target_id": target_id or "—",
-                "target_name": target_name,
-                "target_type": target_type,
-                "action_type": action,
-                "mechanism": moa,
-                "phase": ind.get("max_phase_for_ind", "?"),
+                "activity_type": info["activity_type"],
+                "activity_value": info["activity_value"],
+                "activity_units": info["activity_units"],
+                "pchembl": info["pchembl"],
             })
 
     return results
 
 
-if st.button("🧬  Retrieve targets & mechanisms", use_container_width=True) and disease_query:
-    with st.spinner("Querying ChEMBL for targets and mechanisms..."):
-        st.session_state.mechanism_results = chembl_targets_and_mechanisms(disease_query)
+# ---------- UI: Step 1 ----------
+disease_for_chain = st.text_input(
+    "Disease name",
+    key="disease_chain",
+    placeholder="e.g. type 2 diabetes, malaria, breast cancer...",
+    label_visibility="collapsed",
+)
 
-if st.session_state.get("mechanism_results"):
-    results = st.session_state.mechanism_results
+if st.button("🔬  Step 1: Find proteins linked to this disease", use_container_width=True) and disease_for_chain:
+    with st.spinner("Querying Open Targets for associated proteins..."):
+        proteins, efo_name = get_disease_proteins(disease_for_chain)
+    st.session_state.chain_proteins = proteins
+    st.session_state.chain_disease_name = efo_name or disease_for_chain
+    st.session_state.selected_target = None
+    st.session_state.chain_compounds = None
 
-    # Summary metrics
-    n_compounds = len(set(r["chembl_id"] for r in results))
-    n_targets = len(set(r["target_id"] for r in results if r["target_id"] != "—"))
-    n_mechanisms = len([r for r in results if r["mechanism"] != "No mechanism recorded"])
+# ---------- UI: Step 2 — pick protein ----------
+if st.session_state.get("chain_proteins"):
+    proteins = st.session_state.chain_proteins
+    st.markdown(
+        f"""<div class="card">
+        <b>Disease matched:</b> {st.session_state.get("chain_disease_name", "")}<br>
+        <span style="color:#8b93a1; font-size:0.82rem;">
+        Found <b>{len(proteins)}</b> associated protein targets.
+        Click <b>Find inhibitors</b> next to any protein to see its compounds from ChEMBL.
+        </span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
-    sm1, sm2, sm3 = st.columns(3)
-    sm1.metric("Unique Compounds", n_compounds)
-    sm2.metric("Unique Targets", n_targets)
-    sm3.metric("Mechanisms Found", n_mechanisms)
+    for idx, p in enumerate(proteins[:15]):
+        col_info, col_btn = st.columns([4, 1])
+        with col_info:
+            st.markdown(
+                f"""<div style="background:#12151c; border:1px solid #1e212b;
+                border-radius:12px; padding:12px 16px; margin-bottom:8px;">
+                <b style="color:#4fd1c5;">{p['symbol']}</b>
+                <span style="color:#8b93a1; font-size:0.82rem;"> — {p['name']}</span><br>
+                <span style="color:#8b93a1; font-size:0.72rem;">
+                Target ID: {p['target_id']} · Score: {p['score']:.3f}
+                </span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        with col_btn:
+            if st.button("Find inhibitors", key=f"chain_{idx}", use_container_width=True):
+                st.session_state.selected_target = p
+                st.session_state.chain_compounds = None
 
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    for r in results:
-        smiles_line = f'<code>{r["smiles"]}</code>' if r.get("smiles") else ""
+    # ---------- UI: Step 3 — fetch inhibitors for selected target ----------
+    if st.session_state.get("selected_target"):
+        sel = st.session_state.selected_target
+        st.markdown("<br>", unsafe_allow_html=True)
         st.markdown(
             f"""<div class="card">
-            <b>{r['compound']}</b> <span style="color:#8b93a1;">({r['chembl_id']})</span>
-            &nbsp;·&nbsp; <span style="color:#8b93a1; font-size:0.8rem;">Phase {r['phase']}</span><br>
-            <span style="color:#4fd1c5; font-weight:600;">Target:</span> {r['target_name']}
-            <span style="color:#8b93a1;">({r['target_id']})</span><br>
-            <span style="color:#4fd1c5; font-weight:600;">Type:</span> {r['target_type']}
-            &nbsp;·&nbsp;
-            <span style="color:#4fd1c5; font-weight:600;">Action:</span> {r['action_type']}<br>
-            <span style="color:#4fd1c5; font-weight:600;">Mechanism:</span> {r['mechanism']}<br>
-            {smiles_line}
+            <b style="color:#4fd1c5;">Selected protein: {sel['symbol']}</b><br>
+            <span style="color:#8b93a1; font-size:0.82rem;">{sel['name']}</span>
             </div>""",
             unsafe_allow_html=True,
         )
 
-    # Export as CSV
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow([
-        "Disease", "Compound", "ChEMBL ID", "SMILES",
-        "Target ID", "Target Name", "Target Type",
-        "Action", "Mechanism", "Phase",
-    ])
-    for r in results:
-        writer.writerow([
-            r["disease"], r["compound"], r["chembl_id"], r.get("smiles", ""),
-            r["target_id"], r["target_name"], r["target_type"],
-            r["action_type"], r["mechanism"], r["phase"],
-        ])
-    st.download_button(
-        "📥  Export targets & mechanisms as CSV",
-        data=buf.getvalue(),
-        file_name=f"targets_{disease_query.replace(' ', '_')}.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-elif st.session_state.get("mechanism_results") == []:
-    st.warning("No mechanisms found for this disease — try a different name.")
+        if st.button("🔗  Fetch inhibitor compounds from ChEMBL", use_container_width=True, key="fetch_inhibitors"):
+            with st.spinner(f"Searching ChEMBL for compounds against {sel['symbol']}..."):
+                compounds = get_compounds_for_target(sel["symbol"], sel["name"])
+            st.session_state.chain_compounds = compounds
 
+        if st.session_state.get("chain_compounds") is not None:
+            compounds = st.session_state.chain_compounds
+            if not compounds:
+                st.warning("No compounds found for this target in ChEMBL.")
+            else:
+                st.caption(f"{len(compounds)} compounds found")
+
+                # Export CSV
+                buf = io.StringIO()
+                writer = csv.writer(buf)
+                writer.writerow([
+                    "Target Symbol", "Target Name", "ChEMBL Target ID",
+                    "Compound", "ChEMBL ID", "SMILES",
+                    "Activity Type", "Activity Value", "Units", "pChEMBL",
+                ])
+                for c in compounds:
+                    writer.writerow([
+                        sel["symbol"], sel["name"], c["chembl_target_id"],
+                        c["compound"], c["chembl_id"], c["smiles"],
+                        c["activity_type"], c["activity_value"],
+                        c["activity_units"], c["pchembl"],
+                    ])
+                st.download_button(
+                    "📥  Export compounds as CSV",
+                    data=buf.getvalue(),
+                    file_name=f"compounds_{sel['symbol']}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+                for c in compounds:
+                    st.markdown(
+                        f"""<div class="card">
+                        <b>{c['compound']}</b>
+                        <span style="color:#8b93a1;">({c['chembl_id']})</span><br>
+                        <span style="color:#8b93a1; font-size:0.8rem;">
+                        Target: {c['target_pref_name']} ({c['chembl_target_id']}) ·
+                        {c['target_type']}
+                        </span><br>
+                        <span style="color:#4fd1c5; font-size:0.82rem;">
+                        {c['activity_type']}: {c['activity_value']} {c['activity_units']}
+                        (pChEMBL {c['pchembl']})
+                        </span><br>
+                        <code>{c['smiles']}</code>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+                    if st.button(
+                        f"Send {c['compound']} to Editor →",
+                        key=f"chain_send_{c['chembl_id']}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.smiles = c["smiles"]
+                        st.session_state["_sync_text_input"] = True
+                        save_data()
+                        st.success("SMILES loaded into the Molecule Editor below.")
 
 # ===========================================================
 # SECTION 3 — Molecule Editor
@@ -1308,6 +1301,7 @@ st.markdown(
         Integrated computational drug-discovery workspace ·
         Data from <a href="https://pubmed.ncbi.nlm.nih.gov/" target="_blank">PubMed</a>,
         <a href="https://www.ebi.ac.uk/chembl/" target="_blank">ChEMBL</a>,
+        <a href="https://platform.opentargets.org/" target="_blank">Open Targets</a>,
         <a href="https://www.swisstargetprediction.ch/" target="_blank">SwissTargetPrediction</a>,
         and <a href="https://molview.org/" target="_blank">MolView</a>.
     </div>
