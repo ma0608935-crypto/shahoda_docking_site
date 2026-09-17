@@ -378,7 +378,7 @@ def chembl_lookup(indication: str):
     resp = requests.get(
         "https://www.ebi.ac.uk/chembl/api/data/drug_indication.json",
         params={"search": indication, "limit": 5},
-        timeout=15,
+        timeout=30,
     ).json()
     indications = resp.get("drug_indications", [])
     out = []
