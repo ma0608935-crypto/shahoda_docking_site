@@ -388,7 +388,7 @@ def chembl_lookup(indication: str):
             continue
         mol_resp = requests.get(
             f"https://www.ebi.ac.uk/chembl/api/data/molecule/{molecule_chembl_id}.json",
-            timeout=15,
+            timeout=30,
         ).json()
         smiles = (mol_resp.get("molecule_structures") or {}).get("canonical_smiles")
         pref_name = mol_resp.get("pref_name") or molecule_chembl_id
