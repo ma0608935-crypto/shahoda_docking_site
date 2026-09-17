@@ -61,7 +61,7 @@ def save_data():
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception:
-        pass  # silently ignore save failures
+        pass
 
 
 # ---------------------------------------------------------
@@ -427,27 +427,37 @@ def chembl_lookup(indication: str):
                 continue
         raise last_error
 
-    try:
-        resp = fetch_with_retry(
-            "https://www.ebi.ac.uk/chembl/api/data/drug_indication.json",
-            params={"search": indication, "limit": 5},
-        )
-    except Exception as e:
-        st.error(
-            f"⚠️ ChEMBL is not responding right now "
-            f"(after 3 retries). Please try again in a minute.\n\n"
-            f"Error type: {type(e).__name__}"
+    # Try EFO term first, then MeSH heading as fallback
+    indications = []
+    for param_name in ["efo_term__icontains", "mesh_heading__icontains"]:
+        try:
+            resp = fetch_with_retry(
+                "https://www.ebi.ac.uk/chembl/api/data/drug_indication.json",
+                params={param_name: indication, "limit": 15},
+            )
+            found = resp.get("drug_indications", [])
+            if found:
+                indications = found
+                break
+        except Exception:
+            continue
+
+    if not indications:
+        st.warning(
+            f"No drugs found for '{indication}'. "
+            f"Try a broader term or a different spelling."
         )
         return []
 
-    indications = resp.get("drug_indications", [])
     out = []
+    seen_molecules = set()  # avoid duplicates
     failed_count = 0
 
     for ind in indications:
         molecule_chembl_id = ind.get("molecule_chembl_id")
-        if not molecule_chembl_id:
+        if not molecule_chembl_id or molecule_chembl_id in seen_molecules:
             continue
+        seen_molecules.add(molecule_chembl_id)
 
         try:
             mol_resp = fetch_with_retry(
@@ -465,7 +475,8 @@ def chembl_lookup(indication: str):
                 "name": pref_name,
                 "chembl_id": molecule_chembl_id,
                 "smiles": smiles,
-                "indication": ind.get("efo_term", indication),
+                "indication": ind.get("efo_term") or ind.get("mesh_heading") or indication,
+                "phase": ind.get("max_phase_for_ind", "?"),
             })
 
     if failed_count > 0 and out:
@@ -486,7 +497,9 @@ if st.session_state.get("compound_results"):
         st.markdown(
             f"""<div class="card">
             <b>{c['name']}</b> <span style="color:#8b93a1;">({c['chembl_id']})</span><br>
-            <span style="color:#8b93a1; font-size:0.8rem;">Indication: {c['indication']}</span><br>
+            <span style="color:#8b93a1; font-size:0.8rem;">
+                Indication: {c['indication']} · Phase: {c.get('phase', '?')}
+            </span><br>
             <code>{c['smiles']}</code>
             </div>""",
             unsafe_allow_html=True,
