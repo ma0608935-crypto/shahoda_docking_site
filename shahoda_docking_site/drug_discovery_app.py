@@ -413,7 +413,6 @@ def chembl_lookup(indication: str):
     import time
 
     def fetch_with_retry(url, params=None, retries=3, base_timeout=60):
-        """Fetch URL with automatic retries on timeout."""
         last_error = None
         for attempt in range(retries):
             try:
@@ -427,7 +426,6 @@ def chembl_lookup(indication: str):
                 continue
         raise last_error
 
-    # Try EFO term first, then MeSH heading as fallback
     indications = []
     for param_name in ["efo_term__icontains", "mesh_heading__icontains"]:
         try:
@@ -450,7 +448,7 @@ def chembl_lookup(indication: str):
         return []
 
     out = []
-    seen_molecules = set()  # avoid duplicates
+    seen_molecules = set()
     failed_count = 0
 
     for ind in indications:
@@ -518,6 +516,186 @@ if st.session_state.get("compound_results"):
                 st.success("SMILES saved — see the target prediction section below.")
 elif st.session_state.get("compound_results") == []:
     st.warning("No known drugs found — try a broader or alternate name.")
+
+
+# ===========================================================
+# SECTION 2B — Targets & Mechanisms (compound + protein + action)
+# ===========================================================
+st.markdown(
+    """
+    <div class="section-head">
+        <div class="num">2B</div>
+        <div>
+            <div class="title">Targets & Mechanisms</div>
+            <div class="desc">For each drug, see the protein it hits and the mechanism of action.</div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def chembl_targets_and_mechanisms(indication: str):
+    """
+    For a disease, get each compound + its protein target + mechanism of action.
+    """
+    import time
+
+    def fetch(url, params=None, retries=3, base_timeout=60):
+        for attempt in range(retries):
+            try:
+                r = requests.get(url, params=params, timeout=base_timeout)
+                r.raise_for_status()
+                return r.json()
+            except Exception:
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+        return {}
+
+    # Step 1: get indications
+    indications = []
+    for param in ["efo_term__icontains", "mesh_heading__icontains"]:
+        resp = fetch(
+            "https://www.ebi.ac.uk/chembl/api/data/drug_indication.json",
+            {param: indication, "limit": 15},
+        )
+        if resp.get("drug_indications"):
+            indications = resp["drug_indications"]
+            break
+
+    if not indications:
+        return []
+
+    results = []
+    seen = set()
+
+    for ind in indications:
+        mol_id = ind.get("molecule_chembl_id")
+        if not mol_id or mol_id in seen:
+            continue
+        seen.add(mol_id)
+
+        # Get mechanisms (includes target_id + action_type + mechanism_of_action)
+        mech_resp = fetch(
+            "https://www.ebi.ac.uk/chembl/api/data/mechanism.json",
+            {"molecule_chembl_id": mol_id},
+        )
+        mechanisms = mech_resp.get("mechanisms", [])
+
+        # Get molecule name + SMILES
+        mol_resp = fetch(
+            f"https://www.ebi.ac.uk/chembl/api/data/molecule/{mol_id}.json"
+        )
+        name = mol_resp.get("pref_name") or mol_id
+        smiles = (mol_resp.get("molecule_structures") or {}).get("canonical_smiles")
+
+        if not mechanisms:
+            # Even without mechanism, still record the compound
+            results.append({
+                "disease": indication,
+                "compound": name,
+                "chembl_id": mol_id,
+                "smiles": smiles,
+                "target_id": "—",
+                "target_name": "—",
+                "target_type": "—",
+                "action_type": "—",
+                "mechanism": "No mechanism recorded",
+                "phase": ind.get("max_phase_for_ind", "?"),
+            })
+            continue
+
+        for mech in mechanisms:
+            target_id = mech.get("target_chembl_id")
+            action = mech.get("action_type") or "—"
+            moa = mech.get("mechanism_of_action") or "—"
+
+            target_name = "—"
+            target_type = "—"
+            if target_id:
+                t_resp = fetch(
+                    f"https://www.ebi.ac.uk/chembl/api/data/target/{target_id}.json"
+                )
+                target_name = t_resp.get("pref_name") or "—"
+                target_type = t_resp.get("target_type") or "—"
+
+            results.append({
+                "disease": indication,
+                "compound": name,
+                "chembl_id": mol_id,
+                "smiles": smiles,
+                "target_id": target_id or "—",
+                "target_name": target_name,
+                "target_type": target_type,
+                "action_type": action,
+                "mechanism": moa,
+                "phase": ind.get("max_phase_for_ind", "?"),
+            })
+
+    return results
+
+
+if st.button("🧬  Retrieve targets & mechanisms", use_container_width=True) and disease_query:
+    with st.spinner("Querying ChEMBL for targets and mechanisms..."):
+        st.session_state.mechanism_results = chembl_targets_and_mechanisms(disease_query)
+
+if st.session_state.get("mechanism_results"):
+    results = st.session_state.mechanism_results
+
+    # Summary metrics
+    n_compounds = len(set(r["chembl_id"] for r in results))
+    n_targets = len(set(r["target_id"] for r in results if r["target_id"] != "—"))
+    n_mechanisms = len([r for r in results if r["mechanism"] != "No mechanism recorded"])
+
+    sm1, sm2, sm3 = st.columns(3)
+    sm1.metric("Unique Compounds", n_compounds)
+    sm2.metric("Unique Targets", n_targets)
+    sm3.metric("Mechanisms Found", n_mechanisms)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    for r in results:
+        smiles_line = f'<code>{r["smiles"]}</code>' if r.get("smiles") else ""
+        st.markdown(
+            f"""<div class="card">
+            <b>{r['compound']}</b> <span style="color:#8b93a1;">({r['chembl_id']})</span>
+            &nbsp;·&nbsp; <span style="color:#8b93a1; font-size:0.8rem;">Phase {r['phase']}</span><br>
+            <span style="color:#4fd1c5; font-weight:600;">Target:</span> {r['target_name']}
+            <span style="color:#8b93a1;">({r['target_id']})</span><br>
+            <span style="color:#4fd1c5; font-weight:600;">Type:</span> {r['target_type']}
+            &nbsp;·&nbsp;
+            <span style="color:#4fd1c5; font-weight:600;">Action:</span> {r['action_type']}<br>
+            <span style="color:#4fd1c5; font-weight:600;">Mechanism:</span> {r['mechanism']}<br>
+            {smiles_line}
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+    # Export as CSV
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "Disease", "Compound", "ChEMBL ID", "SMILES",
+        "Target ID", "Target Name", "Target Type",
+        "Action", "Mechanism", "Phase",
+    ])
+    for r in results:
+        writer.writerow([
+            r["disease"], r["compound"], r["chembl_id"], r.get("smiles", ""),
+            r["target_id"], r["target_name"], r["target_type"],
+            r["action_type"], r["mechanism"], r["phase"],
+        ])
+    st.download_button(
+        "📥  Export targets & mechanisms as CSV",
+        data=buf.getvalue(),
+        file_name=f"targets_{disease_query.replace(' ', '_')}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+elif st.session_state.get("mechanism_results") == []:
+    st.warning("No mechanisms found for this disease — try a different name.")
+
 
 # ===========================================================
 # SECTION 3 — Molecule Editor
