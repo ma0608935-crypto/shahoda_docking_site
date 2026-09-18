@@ -63,7 +63,7 @@ def save_data():
 
 
 # ---------------------------------------------------------
-# Global styling — unified dark professional theme
+# Global styling
 # ---------------------------------------------------------
 st.markdown(
     """
@@ -177,7 +177,7 @@ if "scaffold_header" not in st.session_state:
     )
 
 # ---------------------------------------------------------
-# Top navigation + Hero
+# Top nav + Hero
 # ---------------------------------------------------------
 st.markdown("""
 <div class="topnav">
@@ -193,10 +193,10 @@ st.markdown("""
     <p>Search the literature, retrieve known drugs, draw and analyze molecules, predict protein targets, and visualize 3D structures — without leaving the page.</p>
 </div>
 <div class="features">
-    <div class="feature"><div class="ic">📚</div><div class="ttl">Literature Search</div><div class="txt">Live PubMed results for emerging diseases.</div></div>
-    <div class="feature"><div class="ic">💊</div><div class="ttl">Lead Compounds</div><div class="txt">Known drugs and SMILES from ChEMBL.</div></div>
+    <div class="feature"><div class="ic">📚</div><div class="ttl">Literature Search</div><div class="txt">Live PubMed results.</div></div>
+    <div class="feature"><div class="ic">💊</div><div class="ttl">Lead Compounds</div><div class="txt">Known drugs from ChEMBL.</div></div>
     <div class="feature"><div class="ic">🎯</div><div class="ttl">Target Prediction</div><div class="txt">SwissTargetPrediction embedded.</div></div>
-    <div class="feature"><div class="ic">🔬</div><div class="ttl">3D Visualization</div><div class="txt">MolView embedded for 3D exploration.</div></div>
+    <div class="feature"><div class="ic">🔬</div><div class="ttl">3D Visualization</div><div class="txt">MolView embedded.</div></div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -235,53 +235,113 @@ if st.session_state.get("disease_results"):
         <a href="https://pubmed.ncbi.nlm.nih.gov/{r['pmid']}/" target="_blank">View on PubMed</a></div>""", unsafe_allow_html=True)
 
 # ===========================================================
-# SECTION 2 — Disease → Protein → Compound
+# SECTION 2 — Disease → Protein → Compound (FIXED)
 # ===========================================================
 st.markdown('<div class="section-head"><div class="num">2</div><div><div class="title">Disease → Protein → Compound</div><div class="desc">Enter a disease, get its associated proteins, then pull inhibitor compounds from ChEMBL.</div></div></div>', unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_disease_proteins(disease: str):
-    import time
-    def post_graphql(query, variables, retries=3, timeout=60):
-        for attempt in range(retries):
-            try:
-                r = requests.post("https://api.platform.opentargets.org/api/v4/graphql",
-                    json={"query": query, "variables": variables}, timeout=timeout)
-                r.raise_for_status()
-                return r.json()
-            except Exception:
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)
-        return {}
-    q1 = """query SearchDisease($q: String!) {
-      search(queryString: $q, entityNames: ["disease"], page: {index: 0, size: 1}) { hits { id name } }
-    }"""
-    data = post_graphql(q1, {"q": disease})
-    hits = data.get("data", {}).get("search", {}).get("hits", [])
-    if not hits:
-        return [], None
-    efo_id = hits[0]["id"]
-    efo_name = hits[0]["name"]
-    q2 = """query DiseaseTargets($efoId: String!) {
-      disease(efoId: $efoId) { id name
-        associatedTargets(page: {index: 0, size: 25}) {
-          rows { target { id approvedSymbol approvedName } score }
+def get_disease_proteins(disease_name: str):
+    """
+    Step 1: Find proteins associated with a disease using Open Targets Platform.
+    Uses direct GraphQL query with proper variable handling.
+    Returns (targets_list, efo_name).
+    """
+    base_url = "https://api.platform.opentargets.org/api/v4/graphql"
+
+    # Step 1a: search for disease EFO ID
+    search_query = """
+    query SearchDisease($queryString: String!) {
+      search(queryString: $queryString, entityNames: ["disease"], page: {index: 0, size: 1}) {
+        hits {
+          id
+          name
         }
       }
-    }"""
-    data = post_graphql(q2, {"efoId": efo_id})
-    rows = data.get("data", {}).get("disease", {}).get("associatedTargets", {}).get("rows", [])
-    targets = [{"target_id": r.get("target", {}).get("id", ""),
-                "symbol": r.get("target", {}).get("approvedSymbol", ""),
-                "name": r.get("target", {}).get("approvedName", ""),
-                "score": r.get("score", 0)} for r in rows]
-    return targets, efo_name
+    }
+    """
+
+    try:
+        response = requests.post(
+            base_url,
+            json={"query": search_query, "variables": {"queryString": disease_name}},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if "errors" in data:
+            st.error(f"GraphQL error: {data['errors']}")
+            return [], None
+
+        hits = data.get("data", {}).get("search", {}).get("hits", [])
+        if not hits:
+            return [], None
+
+        efo_id = hits[0]["id"]
+        efo_name = hits[0]["name"]
+
+    except Exception as e:
+        st.error(f"Failed to search disease: {type(e).__name__}: {e}")
+        return [], None
+
+    # Step 1b: get associated targets
+    targets_query = """
+    query AssociatedTargets($efoId: String!) {
+      disease(efoId: $efoId) {
+        id
+        name
+        associatedTargets(page: {index: 0, size: 25}) {
+          rows {
+            target {
+              id
+              approvedSymbol
+              approvedName
+            }
+            score
+          }
+        }
+      }
+    }
+    """
+
+    try:
+        response = requests.post(
+            base_url,
+            json={"query": targets_query, "variables": {"efoId": efo_id}},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if "errors" in data:
+            st.error(f"GraphQL error: {data['errors']}")
+            return [], efo_name
+
+        rows = data.get("data", {}).get("disease", {}).get("associatedTargets", {}).get("rows", [])
+
+        targets = []
+        for row in rows:
+            t = row.get("target", {})
+            targets.append({
+                "target_id": t.get("id", ""),
+                "symbol": t.get("approvedSymbol", ""),
+                "name": t.get("approvedName", ""),
+                "score": row.get("score", 0),
+            })
+
+        return targets, efo_name
+
+    except Exception as e:
+        st.error(f"Failed to fetch targets: {type(e).__name__}: {e}")
+        return [], efo_name
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_compounds_for_target(target_symbol: str, target_name: str):
+    """Get active compounds for a protein target from ChEMBL."""
     import time
+
     def fetch(url, params=None, retries=3, timeout=60):
         for attempt in range(retries):
             try:
@@ -292,22 +352,36 @@ def get_compounds_for_target(target_symbol: str, target_name: str):
                 if attempt < retries - 1:
                     time.sleep(2 ** attempt)
         return {}
+
     search_term = target_symbol or target_name
     if not search_term:
         return []
-    target_resp = fetch("https://www.ebi.ac.uk/chembl/api/data/target/search.json",
-        params={"q": search_term, "limit": 3})
+
+    target_resp = fetch(
+        "https://www.ebi.ac.uk/chembl/api/data/target/search.json",
+        params={"q": search_term, "limit": 3},
+    )
     targets = target_resp.get("targets", [])
     if not targets:
         return []
+
     chembl_target_id = targets[0].get("target_chembl_id")
     target_type = targets[0].get("target_type", "")
     pref_name = targets[0].get("pref_name", "")
+
     if not chembl_target_id:
         return []
-    act_resp = fetch("https://www.ebi.ac.uk/chembl/api/data/activity.json",
-        params={"target_chembl_id": chembl_target_id, "pchembl_value__isnull": "false", "limit": 30})
+
+    act_resp = fetch(
+        "https://www.ebi.ac.uk/chembl/api/data/activity.json",
+        params={
+            "target_chembl_id": chembl_target_id,
+            "pchembl_value__isnull": "false",
+            "limit": 30,
+        },
+    )
     activities = act_resp.get("activities", [])
+
     best_by_mol = {}
     for act in activities:
         mol_id = act.get("molecule_chembl_id")
@@ -319,25 +393,47 @@ def get_compounds_for_target(target_symbol: str, target_name: str):
         except (ValueError, TypeError):
             pchembl_val = 0
         if mol_id not in best_by_mol or pchembl_val > best_by_mol[mol_id]["pchembl"]:
-            best_by_mol[mol_id] = {"molecule_chembl_id": mol_id, "pchembl": pchembl_val,
-                "activity_type": act.get("standard_type", ""), "activity_value": act.get("standard_value", ""),
-                "activity_units": act.get("standard_units", "")}
+            best_by_mol[mol_id] = {
+                "molecule_chembl_id": mol_id,
+                "pchembl": pchembl_val,
+                "activity_type": act.get("standard_type", ""),
+                "activity_value": act.get("standard_value", ""),
+                "activity_units": act.get("standard_units", ""),
+            }
+
     results = []
     for mol_id, info in list(best_by_mol.items())[:15]:
-        mol_resp = fetch(f"https://www.ebi.ac.uk/chembl/api/data/molecule/{mol_id}.json")
+        mol_resp = fetch(
+            f"https://www.ebi.ac.uk/chembl/api/data/molecule/{mol_id}.json",
+        )
         if not mol_resp:
             continue
         smiles = (mol_resp.get("molecule_structures") or {}).get("canonical_smiles")
         name = mol_resp.get("pref_name") or mol_id
         if smiles:
-            results.append({"chembl_target_id": chembl_target_id, "target_type": target_type,
-                "target_pref_name": pref_name, "compound": name, "chembl_id": mol_id, "smiles": smiles,
-                "activity_type": info["activity_type"], "activity_value": info["activity_value"],
-                "activity_units": info["activity_units"], "pchembl": info["pchembl"]})
+            results.append({
+                "chembl_target_id": chembl_target_id,
+                "target_type": target_type,
+                "target_pref_name": pref_name,
+                "compound": name,
+                "chembl_id": mol_id,
+                "smiles": smiles,
+                "activity_type": info["activity_type"],
+                "activity_value": info["activity_value"],
+                "activity_units": info["activity_units"],
+                "pchembl": info["pchembl"],
+            })
+
     return results
 
 
-disease_for_chain = st.text_input("Disease name", key="disease_chain", placeholder="e.g. type 2 diabetes, malaria, breast cancer...", label_visibility="collapsed")
+# ---------- UI: Step 1 ----------
+disease_for_chain = st.text_input(
+    "Disease name",
+    key="disease_chain",
+    placeholder="e.g. type 2 diabetes, malaria, breast cancer...",
+    label_visibility="collapsed",
+)
 
 if st.button("🔬  Step 1: Find proteins linked to this disease", use_container_width=True) and disease_for_chain:
     with st.spinner("Querying Open Targets for associated proteins..."):
@@ -346,71 +442,127 @@ if st.button("🔬  Step 1: Find proteins linked to this disease", use_container
     st.session_state.chain_disease_name = efo_name or disease_for_chain
     st.session_state.selected_target = None
     st.session_state.chain_compounds = None
+    if not proteins:
+        st.warning(f"No proteins found for '{disease_for_chain}'. Try a different name or check the spelling.")
 
+# ---------- UI: Step 2 — pick protein ----------
 if st.session_state.get("chain_proteins"):
     proteins = st.session_state.chain_proteins
-    st.markdown(f"""<div class="card"><b>Disease matched:</b> {st.session_state.get("chain_disease_name", "")}<br>
-    <span style="color:#8b93a1; font-size:0.82rem;">Found <b>{len(proteins)}</b> associated protein targets. Click <b>Find inhibitors</b> next to any protein.</span></div>""", unsafe_allow_html=True)
+    st.markdown(
+        f"""<div class="card">
+        <b>Disease matched:</b> {st.session_state.get("chain_disease_name", "")}<br>
+        <span style="color:#8b93a1; font-size:0.82rem;">
+        Found <b>{len(proteins)}</b> associated protein targets.
+        Click <b>Find inhibitors</b> next to any protein to see its compounds from ChEMBL.
+        </span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
     for idx, p in enumerate(proteins[:15]):
         col_info, col_btn = st.columns([4, 1])
         with col_info:
-            st.markdown(f"""<div style="background:#12151c; border:1px solid #1e212b; border-radius:12px; padding:12px 16px; margin-bottom:8px;">
-            <b style="color:#4fd1c5;">{p['symbol']}</b> <span style="color:#8b93a1; font-size:0.82rem;"> — {p['name']}</span><br>
-            <span style="color:#8b93a1; font-size:0.72rem;">Target ID: {p['target_id']} · Score: {p['score']:.3f}</span></div>""", unsafe_allow_html=True)
+            st.markdown(
+                f"""<div style="background:#12151c; border:1px solid #1e212b;
+                border-radius:12px; padding:12px 16px; margin-bottom:8px;">
+                <b style="color:#4fd1c5;">{p['symbol']}</b>
+                <span style="color:#8b93a1; font-size:0.82rem;"> — {p['name']}</span><br>
+                <span style="color:#8b93a1; font-size:0.72rem;">
+                Target ID: {p['target_id']} · Score: {p['score']:.3f}
+                </span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
         with col_btn:
             if st.button("Find inhibitors", key=f"chain_{idx}", use_container_width=True):
                 st.session_state.selected_target = p
                 st.session_state.chain_compounds = None
 
+    # ---------- UI: Step 3 — fetch inhibitors ----------
     if st.session_state.get("selected_target"):
         sel = st.session_state.selected_target
         st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown(f"""<div class="card"><b style="color:#4fd1c5;">Selected protein: {sel['symbol']}</b><br>
-        <span style="color:#8b93a1; font-size:0.82rem;">{sel['name']}</span></div>""", unsafe_allow_html=True)
+        st.markdown(
+            f"""<div class="card">
+            <b style="color:#4fd1c5;">Selected protein: {sel['symbol']}</b><br>
+            <span style="color:#8b93a1; font-size:0.82rem;">{sel['name']}</span>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
         if st.button("🔗  Fetch inhibitor compounds from ChEMBL", use_container_width=True, key="fetch_inhibitors"):
             with st.spinner(f"Searching ChEMBL for compounds against {sel['symbol']}..."):
                 compounds = get_compounds_for_target(sel["symbol"], sel["name"])
             st.session_state.chain_compounds = compounds
+
         if st.session_state.get("chain_compounds") is not None:
             compounds = st.session_state.chain_compounds
             if not compounds:
                 st.warning("No compounds found for this target in ChEMBL.")
             else:
                 st.caption(f"{len(compounds)} compounds found")
+
                 buf = io.StringIO()
                 writer = csv.writer(buf)
-                writer.writerow(["Target Symbol", "Target Name", "ChEMBL Target ID", "Compound", "ChEMBL ID", "SMILES", "Activity Type", "Activity Value", "Units", "pChEMBL"])
+                writer.writerow([
+                    "Target Symbol", "Target Name", "ChEMBL Target ID",
+                    "Compound", "ChEMBL ID", "SMILES",
+                    "Activity Type", "Activity Value", "Units", "pChEMBL",
+                ])
                 for c in compounds:
-                    writer.writerow([sel["symbol"], sel["name"], c["chembl_target_id"], c["compound"], c["chembl_id"], c["smiles"], c["activity_type"], c["activity_value"], c["activity_units"], c["pchembl"]])
-                st.download_button("📥  Export compounds as CSV", data=buf.getvalue(), file_name=f"compounds_{sel['symbol']}.csv", mime="text/csv", use_container_width=True)
+                    writer.writerow([
+                        sel["symbol"], sel["name"], c["chembl_target_id"],
+                        c["compound"], c["chembl_id"], c["smiles"],
+                        c["activity_type"], c["activity_value"],
+                        c["activity_units"], c["pchembl"],
+                    ])
+                st.download_button(
+                    "📥  Export compounds as CSV",
+                    data=buf.getvalue(),
+                    file_name=f"compounds_{sel['symbol']}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
                 for c in compounds:
-                    st.markdown(f"""<div class="card"><b>{c['compound']}</b> <span style="color:#8b93a1;">({c['chembl_id']})</span><br>
-                    <span style="color:#8b93a1; font-size:0.8rem;">Target: {c['target_pref_name']} ({c['chembl_target_id']}) · {c['target_type']}</span><br>
-                    <span style="color:#4fd1c5; font-size:0.82rem;">{c['activity_type']}: {c['activity_value']} {c['activity_units']} (pChEMBL {c['pchembl']})</span><br>
-                    <code>{c['smiles']}</code></div>""", unsafe_allow_html=True)
-                    if st.button(f"Send {c['compound']} to Editor →", key=f"chain_send_{c['chembl_id']}", use_container_width=True):
+                    st.markdown(
+                        f"""<div class="card">
+                        <b>{c['compound']}</b>
+                        <span style="color:#8b93a1;">({c['chembl_id']})</span><br>
+                        <span style="color:#8b93a1; font-size:0.8rem;">
+                        Target: {c['target_pref_name']} ({c['chembl_target_id']}) ·
+                        {c['target_type']}
+                        </span><br>
+                        <span style="color:#4fd1c5; font-size:0.82rem;">
+                        {c['activity_type']}: {c['activity_value']} {c['activity_units']}
+                        (pChEMBL {c['pchembl']})
+                        </span><br>
+                        <code>{c['smiles']}</code>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+                    if st.button(
+                        f"Send {c['compound']} to Editor →",
+                        key=f"chain_send_{c['chembl_id']}",
+                        use_container_width=True,
+                    ):
                         st.session_state.smiles = c["smiles"]
                         st.session_state["_sync_text_input"] = True
                         save_data()
                         st.success("SMILES loaded into the Molecule Editor below.")
 
 # ===========================================================
-# SECTION 2C — Inhibitor Analysis & Optimization
+# SECTION 2C — Inhibitor Analysis
 # ===========================================================
 st.markdown('<div class="section-head"><div class="num">2C</div><div><div class="title">Inhibitor Analysis & Optimization</div><div class="desc">Analyze the inhibitor\'s pharmacophore features and get modification suggestions.</div></div></div>', unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def analyze_inhibitor(smiles: str):
-    """
-    Analyze an inhibitor: pharmacophore features + properties + suggestions.
-    Uses RDKit for 2D analysis (no docking needed).
-    """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
 
-    # Pharmacophore features using SMARTS patterns
     PHARM_SMARTS = {
         "Hydrogen Bond Donor": ["[#7,#8;!H0]"],
         "Hydrogen Bond Acceptor": ["[#7,#8]"],
@@ -434,7 +586,6 @@ def analyze_inhibitor(smiles: str):
                 "atoms": sorted(list(atom_indices)),
             }
 
-    # Properties
     mw = Descriptors.MolWt(mol)
     logp = Crippen.MolLogP(mol)
     hbd = Lipinski.NumHDonors(mol)
@@ -444,26 +595,25 @@ def analyze_inhibitor(smiles: str):
     n_rings = rdMolDescriptors.CalcNumRings(mol)
     n_arom_rings = rdMolDescriptors.CalcNumAromaticRings(mol)
 
-    # Generate suggestions
     suggestions = []
     if hbd == 0:
-        suggestions.append("No hydrogen bond donors found — consider adding a donor group (e.g., -OH, -NH2) to form H-bonds with the target.")
+        suggestions.append("No hydrogen bond donors found — consider adding a donor group (e.g., -OH, -NH2).")
     if hba == 0:
-        suggestions.append("No hydrogen bond acceptors found — consider adding an acceptor group (e.g., carbonyl, ether) to form H-bonds with the target.")
+        suggestions.append("No hydrogen bond acceptors found — consider adding an acceptor group (e.g., carbonyl, ether).")
     if n_arom_rings == 0:
-        suggestions.append("No aromatic rings found — consider adding an aromatic ring for pi-stacking with aromatic residues (Phe, Tyr, Trp).")
+        suggestions.append("No aromatic rings found — consider adding an aromatic ring for pi-stacking.")
     if logp > 5:
-        suggestions.append(f"LogP is high ({logp:.1f}) — consider adding polar groups to reduce lipophilicity and improve solubility.")
+        suggestions.append(f"LogP is high ({logp:.1f}) — consider adding polar groups to reduce lipophilicity.")
     elif logp < 1:
-        suggestions.append(f"LogP is low ({logp:.1f}) — consider adding hydrophobic groups to improve membrane permeability.")
+        suggestions.append(f"LogP is low ({logp:.1f}) — consider adding hydrophobic groups.")
     if tpsa > 140:
-        suggestions.append(f"TPSA is high ({tpsa:.0f} Å²) — may have poor oral absorption. Consider reducing polar surface area.")
+        suggestions.append(f"TPSA is high ({tpsa:.0f} Å²) — may have poor oral absorption.")
     if rot_bonds > 10:
-        suggestions.append(f"Many rotatable bonds ({rot_bonds}) — consider rigidifying the structure to reduce entropic penalty on binding.")
+        suggestions.append(f"Many rotatable bonds ({rot_bonds}) — consider rigidifying the structure.")
     if mw > 500:
-        suggestions.append(f"Molecular weight is high ({mw:.0f}) — consider fragmenting the molecule to improve drug-likeness.")
+        suggestions.append(f"Molecular weight is high ({mw:.0f}) — consider fragmenting.")
     if not suggestions:
-        suggestions.append("The molecule has balanced properties. Consider modifying specific groups to explore structure-activity relationships (SAR).")
+        suggestions.append("The molecule has balanced properties. Consider modifying specific groups to explore SAR.")
 
     return {
         "features": features_found,
@@ -491,8 +641,6 @@ if st.button("🧪  Analyze Inhibitor", use_container_width=True) and inhibitor_
 
 if st.session_state.get("inhibitor_analysis"):
     analysis = st.session_state.inhibitor_analysis
-
-    # ---------- Properties ----------
     st.markdown('<div style="color:#8b93a1; font-size:0.8rem; font-weight:600; letter-spacing:.3px; text-transform:uppercase; margin:20px 0 8px;">Molecular Properties</div>', unsafe_allow_html=True)
     props = analysis["properties"]
     p1, p2, p3, p4 = st.columns(4)
@@ -506,7 +654,6 @@ if st.session_state.get("inhibitor_analysis"):
     p7.metric("Rings", props["Rings"])
     p8.metric("Aromatic Rings", props["AromaticRings"])
 
-    # ---------- Pharmacophore Features ----------
     st.markdown('<div style="color:#8b93a1; font-size:0.8rem; font-weight:600; letter-spacing:.3px; text-transform:uppercase; margin:24px 0 8px;">Pharmacophore Features</div>', unsafe_allow_html=True)
     features = analysis["features"]
     if features:
@@ -519,14 +666,12 @@ if st.session_state.get("inhibitor_analysis"):
     else:
         st.info("No pharmacophore features detected.")
 
-    # ---------- Suggestions ----------
     st.markdown('<div style="color:#8b93a1; font-size:0.8rem; font-weight:600; letter-spacing:.3px; text-transform:uppercase; margin:24px 0 8px;">Modification Suggestions for Derivatives</div>', unsafe_allow_html=True)
     for i, sugg in enumerate(analysis["suggestions"], 1):
         st.markdown(f"""<div class="card" style="padding:12px 16px;">
         <b style="color:#63b3ed;">{i}.</b> {sugg}
         </div>""", unsafe_allow_html=True)
 
-    # ---------- Export ----------
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["Feature", "Count", "Atom Indices"])
@@ -644,7 +789,7 @@ st.markdown("""<div class="card"><b>MolView</b> — interactive molecular viewer
 components.iframe("https://app.molview.com/", height=800, scrolling=True)
 
 # ===========================================================
-# SECTION 6 — My Compounds Library
+# SECTION 6 — My Compounds
 # ===========================================================
 st.markdown('<div class="section-head"><div class="num">6</div><div><div class="title">My Compounds</div><div class="desc">Your personal library — set a percentage for each compound and export the list.</div></div></div>', unsafe_allow_html=True)
 if not st.session_state.my_compounds:
@@ -683,7 +828,7 @@ else:
                 save_data()
                 st.rerun()
         with st.expander("📝 Notes & SMILES"):
-            new_notes = st.text_area("Notes", value=comp.get("notes", ""), key=f"notes_{i}", placeholder="e.g. active against Plasmodium falciparum, tested 2024...", height=80)
+            new_notes = st.text_area("Notes", value=comp.get("notes", ""), key=f"notes_{i}", placeholder="Notes...", height=80)
             if new_notes != comp.get("notes", ""):
                 st.session_state.my_compounds[i]["notes"] = new_notes
                 save_data()
@@ -724,7 +869,7 @@ else:
             if pct <= 0:
                 continue
             color = colors[idx % len(colors)]
-            bar_html += f'<div style="width:{pct}%; background:{color}; display:flex; align-items:center; justify-content:center; color:#0b0d12; font-weight:700; font-size:0.75rem;" title="{c["name"]}: {pct}%">{pct:.1f}%</div>'
+            bar_html += f'<div style="width:{pct}%; background:{color}; display:flex; align-items:center; justify-content:center; color:#0b0d12; font-weight:700; font-size:0.75rem;">{pct:.1f}%</div>'
         bar_html += "</div>"
         st.markdown(bar_html, unsafe_allow_html=True)
     else:
@@ -742,7 +887,7 @@ with h1:
         st.session_state.scaffold_header["title"] = new_title
         save_data()
 with h2:
-    new_orig = st.text_input("Original SMILES", value=st.session_state.scaffold_header["original_smiles"], key="scaffold_orig_input", placeholder="O=C(NC(Cc1ccccc1)C#N)C1CCCN1C(=O)C(NC(=O)C1CC1)C(C)C")
+    new_orig = st.text_input("Original SMILES", value=st.session_state.scaffold_header["original_smiles"], key="scaffold_orig_input", placeholder="Original SMILES")
     if new_orig != st.session_state.scaffold_header["original_smiles"]:
         st.session_state.scaffold_header["original_smiles"] = new_orig
         save_data()
@@ -776,13 +921,13 @@ if st.session_state.scaffold_entries:
     st.markdown("<br>", unsafe_allow_html=True)
     th1, th2, th3, th4, th5 = st.columns([1, 2, 5, 1, 0.7])
     with th1:
-        st.markdown('<div style="color:#4fd1c5; font-weight:700; font-size:0.78rem; letter-spacing:.5px;">D</div>', unsafe_allow_html=True)
+        st.markdown('<div style="color:#4fd1c5; font-weight:700; font-size:0.78rem;">D</div>', unsafe_allow_html=True)
     with th2:
-        st.markdown('<div style="color:#4fd1c5; font-weight:700; font-size:0.78rem; letter-spacing:.5px;">MODIFICATION</div>', unsafe_allow_html=True)
+        st.markdown('<div style="color:#4fd1c5; font-weight:700; font-size:0.78rem;">MODIFICATION</div>', unsafe_allow_html=True)
     with th3:
-        st.markdown('<div style="color:#4fd1c5; font-weight:700; font-size:0.78rem; letter-spacing:.5px;">SMILES</div>', unsafe_allow_html=True)
+        st.markdown('<div style="color:#4fd1c5; font-weight:700; font-size:0.78rem;">SMILES</div>', unsafe_allow_html=True)
     with th4:
-        st.markdown('<div style="color:#4fd1c5; font-weight:700; font-size:0.78rem; letter-spacing:.5px;">%</div>', unsafe_allow_html=True)
+        st.markdown('<div style="color:#4fd1c5; font-weight:700; font-size:0.78rem;">%</div>', unsafe_allow_html=True)
     with th5:
         st.markdown("", unsafe_allow_html=True)
     st.markdown('<hr style="margin:6px 0 12px 0; border-color:#1e212b;">', unsafe_allow_html=True)
@@ -853,19 +998,17 @@ if st.session_state.scaffold_entries:
                         pdf.cell(w, 8, h, border=1, align="C", fill=True)
                     pdf.ln()
                     pdf.set_font("Courier", "", 7)
-                x0 = pdf.get_x()
-                y0 = pdf.get_y()
                 pdf.cell(col_widths[0], row_height, row[0], border=1, align="C")
                 pdf.cell(col_widths[1], row_height, row[1][:20], border=1, align="L")
                 x_after_mod = pdf.get_x()
-                pdf.set_xy(x_after_mod, y0)
+                pdf.set_xy(x_after_mod, pdf.get_y())
                 for ln_idx, line in enumerate(lines):
                     pdf.cell(col_widths[2], 6, line, border=0, align="L")
                     if ln_idx < len(lines) - 1:
                         pdf.ln(6)
                         pdf.set_x(x_after_mod)
-                pdf.set_xy(x_after_mod + col_widths[2], y0)
-                pdf.rect(x_after_mod, y0, col_widths[2], row_height)
+                pdf.set_xy(x_after_mod + col_widths[2], pdf.get_y() - 6 * len(lines))
+                pdf.rect(x_after_mod, pdf.get_y(), col_widths[2], row_height)
                 pdf.cell(col_widths[3], row_height, row[3], border=1, align="C")
                 pdf.ln(row_height)
             return bytes(pdf.output())
