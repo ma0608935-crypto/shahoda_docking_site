@@ -266,36 +266,100 @@ with col_a:
     # ===========================================================
     # SECTION 1 — Disease Discovery (PubMed)
     # ===========================================================
-    st.markdown('<div class="section-head"><div class="num">1</div><div><div class="title">Disease Discovery</div><div class="desc">Search recent PubMed literature for emerging and rare diseases by category.</div></div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-head"><div class="num">1</div><div><div class="title">Disease Discovery</div><div class="desc">Search PubMed for rare, emerging and under-studied diseases by category — press Refresh to see different ones each time.</div></div></div>', unsafe_allow_html=True)
 
     category_map = {"Viral": "viral infection", "Bacterial": "bacterial infection", "Oncology": "cancer OR tumor", "Parasitic": "parasitic infection"}
     category = st.radio("Category", list(category_map.keys()), horizontal=True, label_visibility="collapsed")
 
 
+    # Terms that push the results toward rare / neglected / little-studied diseases
+    RARE_TERMS = (
+        '("rare disease"[tiab] OR "orphan disease"[tiab] OR "neglected disease"[tiab] '
+        'OR "novel disease"[tiab] OR "emerging"[tiab] OR "poorly understood"[tiab] '
+        'OR "understudied"[tiab] OR "limited research"[tiab] OR "unknown etiology"[tiab])'
+    )
+    DISEASE_PAGE = 8
+
+
     @st.cache_data(ttl=3600, show_spinner=False)
-    def search_pubmed_diseases(category_term: str, retmax: int = 8):
-        term = f'("rare disease"[tiab] OR "novel disease"[tiab] OR "emerging"[tiab]) AND ({category_term})'
+    def search_pubmed_diseases(category_term: str, retmax: int = DISEASE_PAGE, retstart: int = 0):
+        """One page of PubMed results. Returns (items, total_hits)."""
+        term = f'{RARE_TERMS} AND ({category_term})'
         esearch = requests.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
-            params={"db": "pubmed", "term": term, "retmax": retmax, "sort": "date", "retmode": "json"}, timeout=15).json()
-        ids = esearch.get("esearchresult", {}).get("idlist", [])
+            params={"db": "pubmed", "term": term, "retmax": retmax, "retstart": retstart,
+                    "sort": "date", "retmode": "json"}, timeout=15).json()
+        res = esearch.get("esearchresult", {})
+        ids = res.get("idlist", [])
+        total = int(res.get("count", 0) or 0)
         if not ids:
-            return []
+            return [], total
         esummary = requests.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
             params={"db": "pubmed", "id": ",".join(ids), "retmode": "json"}, timeout=15).json()
-        return [{"pmid": p, "title": esummary.get("result", {}).get(p, {}).get("title", "Untitled"),
-                 "pubdate": esummary.get("result", {}).get(p, {}).get("pubdate", "")} for p in ids]
+        items = [{"pmid": p, "title": esummary.get("result", {}).get(p, {}).get("title", "Untitled"),
+                  "pubdate": esummary.get("result", {}).get(p, {}).get("pubdate", "")} for p in ids]
+        return items, total
+
+
+    def fetch_new_disease_batch(category_term: str, label: str, reset: bool = False):
+        """Next page of results that were NOT shown before for this category.
+        When every result has been shown, it starts again from the top."""
+        if reset or st.session_state.get("disease_cat") != category_term:
+            st.session_state.disease_seen = []
+            st.session_state.disease_offset = 0
+        seen = set(st.session_state.get("disease_seen", []))
+        offset = st.session_state.get("disease_offset", 0)
+        wrapped = False
+        fresh = []
+        for _ in range(6):
+            items, total = search_pubmed_diseases(category_term, DISEASE_PAGE, offset)
+            if total and offset >= total:      # ran out of results -> start over once
+                if wrapped:
+                    break
+                wrapped, seen, offset = True, set(), 0
+                continue
+            if not items:
+                break
+            offset += DISEASE_PAGE
+            fresh = [i for i in items if i["pmid"] not in seen]
+            if fresh:
+                break
+        st.session_state.disease_seen = list(seen | {i["pmid"] for i in fresh})
+        st.session_state.disease_offset = offset
+        st.session_state.disease_cat = category_term
+        st.session_state.disease_label = label
+        st.session_state.disease_wrapped = wrapped
+        return fresh
 
 
     if st.button("🔍  Search PubMed for candidate diseases", use_container_width=True):
         with st.spinner("Searching PubMed..."):
-            st.session_state.disease_results = search_pubmed_diseases(category_map[category])
+            st.session_state.disease_results = fetch_new_disease_batch(
+                category_map[category], category, reset=True)
+            st.session_state.disease_batch = 1
 
     if st.session_state.get("disease_results"):
-        st.caption(f"{len(st.session_state.disease_results)} recent articles")
+        st.caption(
+            f"{st.session_state.get('disease_label', '')} · batch {st.session_state.get('disease_batch', 1)} · "
+            f"{len(st.session_state.disease_results)} rare / under-studied articles"
+            + (" · restarted from the top (you've seen them all)" if st.session_state.get("disease_wrapped") else "")
+        )
         for r in st.session_state.disease_results:
             st.markdown(f"""<div class="card"><b>{r['title']}</b><br>
             <span style="color:#8b93a1; font-size:0.8rem;">PMID {r['pmid']} · {r['pubdate']}</span> ·
             <a href="https://pubmed.ncbi.nlm.nih.gov/{r['pmid']}/" target="_blank">View on PubMed</a></div>""", unsafe_allow_html=True)
+
+        if st.button("🔄  Refresh — show different ones", use_container_width=True, key="refresh_diseases"):
+            with st.spinner("Looking for new articles..."):
+                fresh = fetch_new_disease_batch(
+                    st.session_state.get("disease_cat") or category_map[category],
+                    st.session_state.get("disease_label") or category,
+                )
+            if fresh:
+                st.session_state.disease_results = fresh
+                st.session_state.disease_batch = st.session_state.get("disease_batch", 1) + 1
+                st.rerun()
+            else:
+                st.info("No new articles found — try another category.")
 
 with col_b:
     # ===========================================================
