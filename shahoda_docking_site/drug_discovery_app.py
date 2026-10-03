@@ -37,6 +37,21 @@ st.set_page_config(
 # ---------------------------------------------------------
 DATA_FILE = Path("user_data.json")
 
+# Everything in here survives a full page refresh (F5): it is written to DATA_FILE
+# after every run and loaded back into st.session_state when a new session starts.
+PERSIST_KEYS = [
+    # library / editor
+    "smiles", "my_compounds", "scaffold_entries", "scaffold_header",
+    # section 1 - disease discovery
+    "disease_category", "disease_results", "disease_batch", "disease_seen",
+    "disease_offset", "disease_cat", "disease_label", "disease_wrapped",
+    # section 2 - disease -> protein -> compound
+    "disease_chain", "chain_proteins", "chain_disease_name",
+    "selected_target", "chain_compounds",
+    # section 2C / 4
+    "inhibitor_smiles_input", "inhibitor_analysis", "show_swiss",
+]
+
 
 def load_data():
     if DATA_FILE.exists():
@@ -49,15 +64,10 @@ def load_data():
 
 
 def save_data():
-    data = {
-        "my_compounds": st.session_state.get("my_compounds", []),
-        "scaffold_entries": st.session_state.get("scaffold_entries", []),
-        "scaffold_header": st.session_state.get("scaffold_header", {}),
-        "smiles": st.session_state.get("smiles", ""),
-    }
+    data = {k: st.session_state[k] for k in PERSIST_KEYS if k in st.session_state}
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
     except Exception:
         pass
 
@@ -176,6 +186,11 @@ if "scaffold_header" not in st.session_state:
         {"title": "SCAFFOLD 12", "original_smiles": "", "targetability": ""},
     )
 
+# Restore everything else that was saved (results, selected protein, analysis, inputs...)
+for _k in PERSIST_KEYS:
+    if _k not in st.session_state and _k in _saved:
+        st.session_state[_k] = _saved[_k]
+
 # ---------------------------------------------------------
 # Top nav + Hero
 # ---------------------------------------------------------
@@ -269,7 +284,9 @@ with col_a:
     st.markdown('<div class="section-head"><div class="num">1</div><div><div class="title">Disease Discovery</div><div class="desc">Search PubMed for rare, emerging and under-studied diseases by category — press Refresh to see different ones each time.</div></div></div>', unsafe_allow_html=True)
 
     category_map = {"Viral": "viral infection", "Bacterial": "bacterial infection", "Oncology": "cancer OR tumor", "Parasitic": "parasitic infection"}
-    category = st.radio("Category", list(category_map.keys()), horizontal=True, label_visibility="collapsed")
+    if st.session_state.get("disease_category") not in category_map:
+        st.session_state.pop("disease_category", None)
+    category = st.radio("Category", list(category_map.keys()), horizontal=True, label_visibility="collapsed", key="disease_category")
 
 
     # Terms that push the results toward rare / neglected / little-studied diseases
@@ -333,33 +350,40 @@ with col_a:
 
     if st.button("🔍  Search PubMed for candidate diseases", use_container_width=True):
         with st.spinner("Searching PubMed..."):
-            st.session_state.disease_results = fetch_new_disease_batch(
-                category_map[category], category, reset=True)
+            first = fetch_new_disease_batch(category_map[category], category, reset=True)
+            st.session_state.disease_results = [dict(r, batch=1) for r in first]
             st.session_state.disease_batch = 1
 
     if st.session_state.get("disease_results"):
+        results = st.session_state.disease_results
         st.caption(
-            f"{st.session_state.get('disease_label', '')} · batch {st.session_state.get('disease_batch', 1)} · "
-            f"{len(st.session_state.disease_results)} rare / under-studied articles"
-            + (" · restarted from the top (you've seen them all)" if st.session_state.get("disease_wrapped") else "")
+            f"{st.session_state.get('disease_label', '')} · {len(results)} rare / under-studied articles "
+            f"so far · {st.session_state.get('disease_batch', 1)} batch(es) — Refresh adds more, nothing is removed"
         )
-        for r in st.session_state.disease_results:
+        last_batch = None
+        for r in results:
+            if r.get("batch") != last_batch:
+                last_batch = r.get("batch")
+                st.markdown(f'<div style="color:#4fd1c5; font-size:0.72rem; font-weight:700; letter-spacing:.5px; margin:14px 0 6px;">BATCH {last_batch}</div>', unsafe_allow_html=True)
             st.markdown(f"""<div class="card"><b>{r['title']}</b><br>
             <span style="color:#8b93a1; font-size:0.8rem;">PMID {r['pmid']} · {r['pubdate']}</span> ·
             <a href="https://pubmed.ncbi.nlm.nih.gov/{r['pmid']}/" target="_blank">View on PubMed</a></div>""", unsafe_allow_html=True)
 
-        if st.button("🔄  Refresh — show different ones", use_container_width=True, key="refresh_diseases"):
+        if st.button("🔄  Refresh — add different ones", use_container_width=True, key="refresh_diseases"):
             with st.spinner("Looking for new articles..."):
                 fresh = fetch_new_disease_batch(
                     st.session_state.get("disease_cat") or category_map[category],
                     st.session_state.get("disease_label") or category,
                 )
-            if fresh:
-                st.session_state.disease_results = fresh
-                st.session_state.disease_batch = st.session_state.get("disease_batch", 1) + 1
+            shown = {r["pmid"] for r in results}
+            new_items = [r for r in fresh if r["pmid"] not in shown]
+            if new_items:
+                batch_no = st.session_state.get("disease_batch", 1) + 1
+                st.session_state.disease_results = results + [dict(r, batch=batch_no) for r in new_items]
+                st.session_state.disease_batch = batch_no
                 st.rerun()
             else:
-                st.info("No new articles found — try another category.")
+                st.info("No new articles left for this category — try another one.")
 
 with col_b:
     # ===========================================================
@@ -760,9 +784,10 @@ with col_a:
         }
 
 
+    if "inhibitor_smiles_input" not in st.session_state:
+        st.session_state["inhibitor_smiles_input"] = st.session_state.get("smiles", "")
     inhibitor_smiles = st.text_input(
         "Inhibitor SMILES",
-        value=st.session_state.get("smiles", ""),
         key="inhibitor_smiles_input",
         placeholder="Paste an inhibitor SMILES to analyze...",
         label_visibility="collapsed",
@@ -827,6 +852,8 @@ with col_b:
     # ===========================================================
     st.markdown('<div class="section-head"><div class="num">3</div><div><div class="title">Molecule Editor</div><div class="desc">Draw or paste a SMILES — molecular properties update in real time.</div></div></div>', unsafe_allow_html=True)
 
+    if "smiles_input" not in st.session_state:
+        st.session_state["smiles_input"] = st.session_state.smiles
     if st.session_state.get("_sync_text_input", False):
         st.session_state["smiles_input"] = st.session_state.smiles
         st.session_state["_sync_text_input"] = False
