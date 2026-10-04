@@ -163,6 +163,40 @@ st.markdown(
     .footer { text-align: center; color: #565e6d; font-size: 0.78rem;
         padding: 26px 0 6px; border-top: 1px solid #1e212b; margin-top: 60px; }
     .footer a { color: #63b3ed; text-decoration: none; }
+    .empty-state {
+        border: 1.5px dashed #2a3140; border-radius: 14px; padding: 22px 20px;
+        text-align: center; background: rgba(18,21,28,.5); margin: 8px 0 14px;
+    }
+    .empty-state .ic { font-size: 1.7rem; margin-bottom: 6px; }
+    .empty-state .ttl { color: #e2e5ea; font-weight: 650; font-size: 0.95rem; }
+    .empty-state .txt { color: #8b93a1; font-size: 0.82rem; margin-top: 4px; line-height: 1.5; }
+
+    /* ---------- Tablet / phone ---------- */
+    @media (max-width: 768px) {
+        .block-container { padding: 0 1rem 3rem; }
+        .topnav { padding: 12px 1rem 10px; margin: 0 -1rem 20px; }
+        .topnav .nav-links { display: none; }
+        .hero { padding: 30px 22px 28px; margin-bottom: 26px; border-radius: 16px; }
+        .hero h1 { font-size: 1.8rem; }
+        .hero p { font-size: 0.92rem; }
+        .features { grid-template-columns: repeat(2, 1fr); }
+        .section-head { margin: 34px 0 16px; }
+        .section-head .title { font-size: 1.2rem; }
+        .card { padding: 14px 16px; }
+        hr { margin: 28px 0; }
+        .footer { margin-top: 36px; }
+    }
+    @media (max-width: 640px) {
+        /* Streamlit stacks all columns on phones; keep metric tiles two per row instead of one per row */
+        div[data-testid="stColumn"] div[data-testid="stColumn"]:has(div[data-testid="stMetric"]) {
+            flex: 1 1 calc(50% - 1rem) !important; min-width: calc(50% - 1rem) !important;
+        }
+        div[data-testid="stMetric"] { padding: 10px 12px; }
+    }
+    @media (max-width: 480px) {
+        .features { grid-template-columns: 1fr; }
+        .hero h1 { font-size: 1.5rem; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -190,6 +224,29 @@ if "scaffold_header" not in st.session_state:
 for _k in PERSIST_KEYS:
     if _k not in st.session_state and _k in _saved:
         st.session_state[_k] = _saved[_k]
+
+# ---------------------------------------------------------
+# Small UI helpers
+# ---------------------------------------------------------
+def empty_state(icon: str, title: str, text: str):
+    """Friendly placeholder that tells the user what to do next."""
+    st.markdown(
+        f'<div class="empty-state"><div class="ic">{icon}</div>'
+        f'<div class="ttl">{title}</div><div class="txt">{text}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def friendly_error(service: str, e: Exception):
+    """Plain-language error message; the technical detail is kept small underneath."""
+    if isinstance(e, requests.exceptions.Timeout):
+        st.error(f"{service} took too long to answer. Wait a few seconds and press the button again.")
+    elif isinstance(e, requests.exceptions.ConnectionError):
+        st.error(f"Couldn't reach {service}. Check your internet connection and try again.")
+    else:
+        st.error(f"{service} returned an error. Try again in a minute.")
+    st.caption(f"Technical detail: {type(e).__name__}: {e}")
+
 
 # ---------------------------------------------------------
 # Top nav + Hero
@@ -349,10 +406,15 @@ with col_a:
 
 
     if st.button("🔍  Search PubMed for candidate diseases", use_container_width=True):
-        with st.spinner("Searching PubMed..."):
-            first = fetch_new_disease_batch(category_map[category], category, reset=True)
+        try:
+            with st.spinner(f"Searching PubMed for rare / under-studied {category.lower()} diseases… (about 2–5 seconds)"):
+                first = fetch_new_disease_batch(category_map[category], category, reset=True)
             st.session_state.disease_results = [dict(r, batch=1) for r in first]
             st.session_state.disease_batch = 1
+            if not first:
+                st.warning("PubMed returned nothing for this category. Try another one.")
+        except Exception as e:
+            friendly_error("PubMed", e)
 
     if st.session_state.get("disease_results"):
         results = st.session_state.disease_results
@@ -370,11 +432,15 @@ with col_a:
             <a href="https://pubmed.ncbi.nlm.nih.gov/{r['pmid']}/" target="_blank">View on PubMed</a></div>""", unsafe_allow_html=True)
 
         if st.button("🔄  Refresh — add different ones", use_container_width=True, key="refresh_diseases"):
-            with st.spinner("Looking for new articles..."):
-                fresh = fetch_new_disease_batch(
-                    st.session_state.get("disease_cat") or category_map[category],
-                    st.session_state.get("disease_label") or category,
-                )
+            try:
+                with st.spinner("Looking for articles you haven't seen yet…"):
+                    fresh = fetch_new_disease_batch(
+                        st.session_state.get("disease_cat") or category_map[category],
+                        st.session_state.get("disease_label") or category,
+                    )
+            except Exception as e:
+                friendly_error("PubMed", e)
+                fresh = []
             shown = {r["pmid"] for r in results}
             new_items = [r for r in fresh if r["pmid"] not in shown]
             if new_items:
@@ -384,6 +450,10 @@ with col_a:
                 st.rerun()
             else:
                 st.info("No new articles left for this category — try another one.")
+    elif not st.session_state.get("disease_label"):
+        empty_state("🔎", "Nothing here yet",
+                    "Pick a category above and press <b>Search PubMed</b>. You'll get recent articles about rare and "
+                    "little-studied diseases — press <b>Refresh</b> afterwards to add different ones.")
 
 with col_b:
     # ===========================================================
@@ -423,8 +493,7 @@ with col_b:
             data = response.json()
 
             if "errors" in data:
-                st.error(f"GraphQL error: {data['errors']}")
-                return [], None
+                raise RuntimeError(f"Open Targets reported an error: {data['errors']}")
 
             hits = data.get("data", {}).get("search", {}).get("hits", [])
             if not hits:
@@ -433,9 +502,8 @@ with col_b:
             efo_id = hits[0]["id"]
             efo_name = hits[0]["name"]
 
-        except Exception as e:
-            st.error(f"Failed to search disease: {type(e).__name__}: {e}")
-            return [], None
+        except Exception:
+            raise  # not cached, so a temporary network problem doesn't stick for an hour
 
         # Step 1b: get associated targets
         targets_query = """
@@ -467,8 +535,7 @@ with col_b:
             data = response.json()
 
             if "errors" in data:
-                st.error(f"GraphQL error: {data['errors']}")
-                return [], efo_name
+                raise RuntimeError(f"Open Targets reported an error: {data['errors']}")
 
             rows = data.get("data", {}).get("disease", {}).get("associatedTargets", {}).get("rows", [])
 
@@ -484,9 +551,8 @@ with col_b:
 
             return targets, efo_name
 
-        except Exception as e:
-            st.error(f"Failed to fetch targets: {type(e).__name__}: {e}")
-            return [], efo_name
+        except Exception:
+            raise
 
 
     @st.cache_data(ttl=3600, show_spinner=False)
@@ -494,15 +560,19 @@ with col_b:
         """Get active compounds for a protein target from ChEMBL."""
         import time
 
-        def fetch(url, params=None, retries=3, timeout=60):
+        def fetch(url, params=None, retries=3, timeout=60, required=False):
+            last_err = None
             for attempt in range(retries):
                 try:
                     r = requests.get(url, params=params, timeout=timeout)
                     r.raise_for_status()
                     return r.json()
-                except Exception:
+                except Exception as e:
+                    last_err = e
                     if attempt < retries - 1:
                         time.sleep(2 ** attempt)
+            if required and last_err is not None:
+                raise last_err  # failures must not be cached as "no compounds"
             return {}
 
         search_term = target_symbol or target_name
@@ -512,6 +582,7 @@ with col_b:
         target_resp = fetch(
             "https://www.ebi.ac.uk/chembl/api/data/target/search.json",
             params={"q": search_term, "limit": 3},
+            required=True,
         )
         targets = target_resp.get("targets", [])
         if not targets:
@@ -531,6 +602,7 @@ with col_b:
                 "pchembl_value__isnull": "false",
                 "limit": 30,
             },
+            required=True,
         )
         activities = act_resp.get("activities", [])
 
@@ -587,15 +659,22 @@ with col_b:
         label_visibility="collapsed",
     )
 
-    if st.button("🔬  Step 1: Find proteins linked to this disease", use_container_width=True) and disease_for_chain:
-        with st.spinner("Querying Open Targets for associated proteins..."):
-            proteins, efo_name = get_disease_proteins(disease_for_chain)
-        st.session_state.chain_proteins = proteins
-        st.session_state.chain_disease_name = efo_name or disease_for_chain
-        st.session_state.selected_target = None
-        st.session_state.chain_compounds = None
-        if not proteins:
-            st.warning(f"No proteins found for '{disease_for_chain}'. Try a different name or check the spelling.")
+    step1_clicked = st.button("🔬  Step 1: Find proteins linked to this disease", use_container_width=True)
+    if step1_clicked and not disease_for_chain.strip():
+        st.warning("Type a disease name first — for example: malaria, tuberculosis or breast cancer.")
+    elif step1_clicked:
+        try:
+            with st.spinner(f"Asking Open Targets which proteins are linked to “{disease_for_chain}”… (up to 30 seconds)"):
+                proteins, efo_name = get_disease_proteins(disease_for_chain)
+        except Exception as e:
+            friendly_error("Open Targets", e)
+        else:
+            st.session_state.chain_proteins = proteins
+            st.session_state.chain_disease_name = efo_name or disease_for_chain
+            st.session_state.selected_target = None
+            st.session_state.chain_compounds = None
+            if not proteins:
+                st.warning(f"No proteins found for '{disease_for_chain}'. Try a different name or check the spelling.")
 
     # ---------- UI: Step 2 — pick protein ----------
     if st.session_state.get("chain_proteins"):
@@ -643,9 +722,13 @@ with col_b:
             )
 
             if st.button("🔗  Fetch inhibitor compounds from ChEMBL", use_container_width=True, key="fetch_inhibitors"):
-                with st.spinner(f"Searching ChEMBL for compounds against {sel['symbol']}..."):
-                    compounds = get_compounds_for_target(sel["symbol"], sel["name"])
-                st.session_state.chain_compounds = compounds
+                try:
+                    with st.spinner(f"Searching ChEMBL for compounds that act on {sel['symbol']}… "
+                                    "this can take 20–60 seconds because each molecule is fetched separately."):
+                        compounds = get_compounds_for_target(sel["symbol"], sel["name"])
+                    st.session_state.chain_compounds = compounds
+                except Exception as e:
+                    friendly_error("ChEMBL", e)
 
             if st.session_state.get("chain_compounds") is not None:
                 compounds = st.session_state.chain_compounds
@@ -702,6 +785,12 @@ with col_b:
                             st.session_state["_sync_text_input"] = True
                             save_data()
                             st.success("SMILES loaded into the Molecule Editor below.")
+        else:
+            st.caption("👆 Choose a protein above and press **Find inhibitors** to continue.")
+    elif not st.session_state.get("chain_disease_name"):
+        empty_state("🧬", "Start with a disease",
+                    "Type a disease name above (e.g. <i>malaria</i>, <i>Chagas disease</i>) and press <b>Step 1</b>. "
+                    "Next you'll pick a protein, then fetch known inhibitors from ChEMBL.")
 
 
 # ###########################################################
@@ -793,10 +882,23 @@ with col_a:
         label_visibility="collapsed",
     )
 
-    if st.button("🧪  Analyze Inhibitor", use_container_width=True) and inhibitor_smiles:
-        with st.spinner("Analyzing pharmacophore features..."):
-            analysis = analyze_inhibitor(inhibitor_smiles)
-        st.session_state.inhibitor_analysis = analysis
+    def _use_editor_smiles():
+        st.session_state["inhibitor_smiles_input"] = st.session_state.get("smiles", "")
+
+    if st.session_state.get("smiles") and st.session_state.get("inhibitor_smiles_input") != st.session_state.get("smiles"):
+        st.button("↳  Use the SMILES from the Molecule Editor", on_click=_use_editor_smiles,
+                  key="use_editor_smiles", use_container_width=True)
+
+    analyze_clicked = st.button("🧪  Analyze Inhibitor", use_container_width=True)
+    if analyze_clicked and not inhibitor_smiles.strip():
+        st.warning("Paste a SMILES first — or send one from section 2 / the editor.")
+    elif analyze_clicked:
+        with st.spinner("Reading the structure and looking for pharmacophore features…"):
+            analysis = analyze_inhibitor(inhibitor_smiles.strip())
+        if analysis is None:
+            st.error("Couldn't read this SMILES. Check it for typos or copy it again from the editor.")
+        else:
+            st.session_state.inhibitor_analysis = analysis
 
     if st.session_state.get("inhibitor_analysis"):
         analysis = st.session_state.inhibitor_analysis
@@ -845,6 +947,10 @@ with col_a:
         for s in analysis["suggestions"]:
             writer.writerow([s])
         st.download_button("📥  Export analysis as CSV", data=buf.getvalue(), file_name="inhibitor_analysis.csv", mime="text/csv", use_container_width=True)
+    else:
+        empty_state("🧪", "No analysis yet",
+                    "Paste an inhibitor SMILES above and press <b>Analyze Inhibitor</b> to see its properties, "
+                    "pharmacophore features and ideas for modifications.")
 
 with col_b:
     # ===========================================================
@@ -874,7 +980,12 @@ with col_b:
     with right:
         st.markdown('<div style="color:#8b93a1; font-size:0.82rem; font-weight:600; letter-spacing:.3px; text-transform:uppercase; margin-bottom:10px;">Compound Preview</div>', unsafe_allow_html=True)
         if not smiles:
-            st.info("Draw a structure, enter a SMILES, or send a compound from section 2.")
+            empty_state("✏️", "No molecule yet",
+                        "Draw one on the canvas, paste a SMILES, or send a compound from section 2.")
+            if st.button("Try an example (aspirin)", key="load_example", use_container_width=True):
+                st.session_state.smiles = "CC(=O)Oc1ccccc1C(=O)O"
+                st.session_state["_sync_text_input"] = True
+                st.rerun()
         else:
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
@@ -940,6 +1051,8 @@ with col_a:
     swiss_hint = st.empty()
     if saved:
         swiss_hint.markdown(f"""<div class="card"><span style="color:#8b93a1; font-size:0.8rem;">Your current SMILES — copy this into SwissTargetPrediction:</span><br><code>{saved}</code></div>""", unsafe_allow_html=True)
+    else:
+        swiss_hint.markdown("""<div class="card"><span style="color:#8b93a1; font-size:0.82rem;">No molecule yet — draw or paste one in section 3 and its SMILES will appear here, ready to copy.</span></div>""", unsafe_allow_html=True)
     if "show_swiss" not in st.session_state:
         st.session_state.show_swiss = False
     if not st.session_state.show_swiss:
@@ -972,7 +1085,9 @@ with col_a:
     # ===========================================================
     st.markdown('<div class="section-head"><div class="num">6</div><div><div class="title">My Compounds</div><div class="desc">Your personal library — set a percentage for each compound and export the list.</div></div></div>', unsafe_allow_html=True)
     if not st.session_state.my_compounds:
-        st.info("No compounds added yet. Go to Section 3 (Molecule Editor), draw a molecule, and click **➕ Add to My Compounds**.")
+        empty_state("🗂️", "Your library is empty",
+                    "Draw a molecule in the Molecule Editor (section 3) and press <b>➕ Add to My Compounds</b> — "
+                    "it will show up here with a percentage box.")
     else:
         total = len(st.session_state.my_compounds)
         total_pct = sum(c.get("percentage", 0) or 0 for c in st.session_state.my_compounds)
@@ -1203,7 +1318,8 @@ with col_b:
                 save_data()
                 st.rerun()
     else:
-        st.info("No entries yet — fill in the fields above and click **➕ Add**.")
+        empty_state("📋", "No entries yet",
+                    "Fill in the D code, modification, SMILES and % above, then press <b>➕ Add</b>.")
 
 
 # ---------------------------------------------------------
